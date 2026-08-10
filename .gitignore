@@ -1,0 +1,4 @@
+results/
+__pycache__/
+MobileCLIP2-S0/text.onnx
+MobileCLIP2-S0/text.onnx.data

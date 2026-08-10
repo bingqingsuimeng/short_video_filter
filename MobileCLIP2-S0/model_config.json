@@ -1,0 +1,8 @@
+{
+  "logit_scale": 64.32988739013672,
+  "logit_bias": 0.0,
+  "activation_function": "softmax",
+  "tokenizer_needs_lowercase": false,
+  "pad_id": 0,
+  "vocab_size": 49408
+}

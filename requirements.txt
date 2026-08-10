@@ -1,0 +1,12 @@
+# ========================================
+# 短视频人脸清洗流水线 v6 - 运行时依赖
+# ========================================
+opencv-python>=4.8
+numpy>=1.24
+onnxruntime-gpu>=1.18
+
+# GPU 加速所需的 CUDA 12 运行时库
+nvidia-cuda-runtime-cu12>=12.4
+nvidia-cublas-cu12>=12.4
+nvidia-cudnn-cu12>=9.0
+nvidia-cufft-cu12>=11.0
