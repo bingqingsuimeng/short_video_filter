@@ -122,7 +122,7 @@ CLIP EP:  ['CUDAExecutionProvider', 'CPUExecutionProvider']
 | 模型 | 来源 | 用途 |
 |------|------|------|
 | SCRFD 500M | [insightface](https://github.com/deepinsight/insightface) | 人脸检测 |
-| MobileCLIP2-S0 | [MobileCLIP](https://huggingface.co/mobile-clip) | 人脸属性零分类 |
+| MobileCLIP2-S0 | [MobileCLIP](https://huggingface.co/RuteNL/MobileCLIP2-S0-OpenCLIP-ONNX/tree/main) | 人脸属性零分类 |
 | clip_text_embeds.npy | 本地预计算 | 5 类文本嵌入 |
 
 ## 使用方法
