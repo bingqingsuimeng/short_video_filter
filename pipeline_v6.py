@@ -120,16 +120,23 @@ def resolve_rotation_plan(meta: dict, first_frame: np.ndarray) -> Tuple[bool, in
 # ============================================================ #
 # 2. Thread-Safe SCRFD 检测器
 # ============================================================ #
+# 默认 Execution Provider，自动优先 TensorRT + FP16
+def _default_providers():
+    return [
+        ("CUDAExecutionProvider", {"device_id": 0}),
+        "CPUExecutionProvider"
+    ]
+
 class SCRFDFastDetector:
-    def __init__(self, model_path: str, input_size=640, conf_thres=0.5, nms_thres=0.4):
-        providers = [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
-        self.sess = ort.InferenceSession(model_path, providers=providers)
+    def __init__(self, model_path: str, input_size=640, conf_thres=0.5, nms_thres=0.4,
+                 providers: Optional[List] = None):
+        self.sess = ort.InferenceSession(model_path, providers=providers or _default_providers())
         self.input_name = self.sess.get_inputs()[0].name
         self.input_size = input_size
         self.conf_thres = conf_thres
         self.nms_thres = nms_thres
         self.strides = [8, 16, 32]
-        
+
         # 预计算 Anchor Centers，并发只读，彻底消除多线程字典竞态
         self._anchor_centers = {}
         for stride in self.strides:
@@ -139,22 +146,44 @@ class SCRFDFastDetector:
             centers = np.stack([centers, centers], axis=2).reshape(-1, 2)
             self._anchor_centers[stride] = centers
 
+        # 预分配推理输入 buffer，避免每次调用都申请新内存
+        self._input_blob = np.zeros((1, 3, self.input_size, self.input_size), dtype=np.float32)
+
+        # 预分配 canvas（letterbox 用），复用减少分配
+        self._canvas = np.zeros((self.input_size, self.input_size, 3), dtype=np.uint8)
+
+        # 预分配后处理临时 buffer
+        self._post_nms_result = np.empty((0, 4), dtype=np.float32)
+
     def letterbox(self, frame: np.ndarray) -> Tuple[np.ndarray, float]:
         h, w = frame.shape[:2]
         scale = min(self.input_size / w, self.input_size / h)
         nw, nh = int(w * scale), int(h * scale)
         resized = cv2.resize(frame, (nw, nh))
-        canvas = np.zeros((self.input_size, self.input_size, 3), dtype=np.uint8)
-        canvas[:nh, :nw, :] = resized
-        return canvas, scale
+        # 复用预分配 canvas
+        c = self._canvas
+        c.fill(0)
+        c[:nh, :nw, :] = resized
+        return c, scale
 
-    def detect_single(self, canvas: np.ndarray) -> List[Tuple[np.ndarray, float]]:
-        """Run detection on a single frame (fixed batch=1 model)."""
-        blob = (canvas.astype(np.float32) - 127.5) / 128.0
-        blob = blob.transpose(2, 0, 1)[::-1][np.newaxis, :]  # Add batch dim
+    def preprocess(self, frame: np.ndarray) -> Tuple[np.ndarray, float]:
+        """Letterbox + normalize + transpose 合并，直接写入预分配 blob"""
+        h, w = frame.shape[:2]
+        scale = min(self.input_size / w, self.input_size / h)
+        nw, nh = int(w * scale), int(h * scale)
+        resized = cv2.resize(frame, (nw, nh))
 
-        net_outs = self.sess.run(None, {self.input_name: blob})
+        # 直接写入预分配的 blob (BGR + normalize)
+        b = self._input_blob[0]
+        b[0, :nh, :nw] = (resized[:, :, 2].astype(np.float32) - 127.5) * 0.0078125
+        b[1, :nh, :nw] = (resized[:, :, 1].astype(np.float32) - 127.5) * 0.0078125
+        b[2, :nh, :nw] = (resized[:, :, 0].astype(np.float32) - 127.5) * 0.0078125
+        b[:, nh:, :] = b[:, :, nw:] = 0
 
+        return self._input_blob, scale
+
+    def _postprocess(self, net_outs: List) -> List[Tuple[np.ndarray, float]]:
+        """Optimized postprocessing - pure numpy NMS, no .tolist() conversion"""
         boxes_list, scores_list = [], []
         for idx, stride in enumerate(self.strides):
             scores = net_outs[idx].flatten()
@@ -177,14 +206,57 @@ class SCRFDFastDetector:
 
         all_boxes = np.concatenate(boxes_list)
         all_scores = np.concatenate(scores_list)
-        indices = cv2.dnn.NMSBoxes(all_boxes.tolist(), all_scores.tolist(), self.conf_thres, self.nms_thres)
+        keep = self._fast_nms(all_boxes, all_scores)
 
-        frame_faces = []
-        if len(indices) > 0:
-            for k in np.array(indices).flatten():
-                bx, by, bw, bh = all_boxes[k]
-                frame_faces.append((np.array([bx, by, bx + bw, by + bh]), float(all_scores[k])))
-        return frame_faces
+        if len(keep) == 0:
+            return []
+
+        result = all_boxes[keep].copy()
+        result[:, 2] += result[:, 0]  # x1, y1, w, h → x1, y1, x2, y2
+        result[:, 3] += result[:, 1]
+        scores_sel = all_scores[keep]
+        return [(result[i], float(scores_sel[i])) for i in range(len(keep))]
+
+    def _fast_nms(self, boxes: np.ndarray, scores: np.ndarray) -> np.ndarray:
+        """Pure numpy NMS, 避免 .tolist() 转换开销"""
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = x1 + boxes[:, 2]
+        y2 = y1 + boxes[:, 3]
+        areas = (x2 - x1) * (y2 - y1)
+        order = scores.argsort()[::-1]
+
+        keep = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            w = np.maximum(0.0, xx2 - xx1)
+            h = np.maximum(0.0, yy2 - yy1)
+            inter = w * h
+            ovr = inter / (areas[i] + areas[order[1:]] - inter)
+            inds = np.where(ovr <= self.nms_thres)[0]
+            order = order[inds + 1]
+        return np.array(keep, dtype=np.intp)
+
+    def detect_single(self, canvas: np.ndarray) -> List[Tuple[np.ndarray, float]]:
+        """Run detection on a single frame (fixed batch=1 model)."""
+        b = self._input_blob[0]
+        b[0] = (canvas[:, :, 2].astype(np.float32) - 127.5) * 0.0078125
+        b[1] = (canvas[:, :, 1].astype(np.float32) - 127.5) * 0.0078125
+        b[2] = (canvas[:, :, 0].astype(np.float32) - 127.5) * 0.0078125
+
+        net_outs = self.sess.run(None, {self.input_name: self._input_blob})
+        return self._postprocess(net_outs)
+
+    def detect_single_fast(self, frame: np.ndarray) -> Tuple[List[Tuple[np.ndarray, float]], float]:
+        """Fast detection with optimized preprocessing, returns (faces, scale)"""
+        blob, scale = self.preprocess(frame)
+        net_outs = self.sess.run(None, {self.input_name: blob})
+        return self._postprocess(net_outs), scale
 
     def detect_batch(self, letterboxed_frames: List[np.ndarray]) -> List[List[Tuple[np.ndarray, float]]]:
         """Loop over frames for fixed-batch models."""
@@ -258,9 +330,9 @@ class CLIPAttributeFilter:
         "no_glasses": "portrait of a person without any glasses on their face",
     }
 
-    def __init__(self, visual_onnx_path: str, text_embeds_path: str, input_size=256, margin=0.01):
-        providers = [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
-        self.sess = ort.InferenceSession(visual_onnx_path, providers=providers)
+    def __init__(self, visual_onnx_path: str, text_embeds_path: str, input_size=256, margin=0.01,
+                 providers: Optional[List] = None):
+        self.sess = ort.InferenceSession(visual_onnx_path, providers=providers or _default_providers())
         self.input_name = self.sess.get_inputs()[0].name
         self.input_size = input_size
         self.text_embeds = np.load(text_embeds_path)
@@ -301,9 +373,11 @@ class CLIPAttributeFilter:
 # 4. 主流水线 (Early Exit 优化版)
 # ============================================================ #
 class ProductionVideoCleaningPipeline:
-    def __init__(self, scrfd_path: str, clip_visual_path: str, clip_text_embeds_path: str, sample_fps=5, batch_size=16, first_window_sec=3):
-        self.detector = SCRFDFastDetector(scrfd_path)
-        self.clip_filter = CLIPAttributeFilter(clip_visual_path, clip_text_embeds_path)
+    def __init__(self, scrfd_path: str, clip_visual_path: str, clip_text_embeds_path: str,
+                 sample_fps=5, batch_size=16, first_window_sec=3,
+                 providers: Optional[List] = None):
+        self.detector = SCRFDFastDetector(scrfd_path, providers=providers)
+        self.clip_filter = CLIPAttributeFilter(clip_visual_path, clip_text_embeds_path, providers=providers)
         self.sample_fps = sample_fps
         self.batch_size = batch_size
         self.first_window_sec = first_window_sec

@@ -71,12 +71,10 @@ for img_path in img_paths:
     h, w = img.shape[:2]
     basename = os.path.basename(img_path)
 
-    # 1. Letterbox 与检测
-    canvas, scale = scrfd.letterbox(img)
-
+    # 1. 检测 (使用 detect_single_fast，合并 letterbox+preprocess)
     t0 = time.perf_counter()
     for _ in range(N):
-        faces = scrfd.detect_single(canvas)
+        faces, scale = scrfd.detect_single_fast(img)
     scrfd_ms = (time.perf_counter() - t0) / N * 1000
     scrfd_times.append(scrfd_ms)
 
