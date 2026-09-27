@@ -11,6 +11,7 @@ __pycache__/
 
 # 旧 CLIP 项目的逐人结果记录(不属于本管线)
 *_checkpoint.json
+data/
 
 # 输出 / 临时
 results/

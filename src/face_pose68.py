@@ -19,7 +19,7 @@ Only the last 68 points are used; the first 1035 points of the 3309-dim
 output are discarded (insightface does the same).
 
 Requires the engine built with:
-  trtexec --onnx=1k3d68.onnx --saveEngine=1k3d68_dyn.engine \
+  trtexec --onnx=models/pose68/1k3d68.onnx --saveEngine=models/pose68/1k3d68_dyn.engine \
     --minShapes=data:1x3x192x192 --optShapes=data:16x3x192x192 \
     --maxShapes=data:32x3x192x192
 """
@@ -244,12 +244,13 @@ class FacePose68:
 if __name__ == "__main__":
     import sys
     import time
-    root = os.path.dirname(os.path.abspath(__file__))
-    engine = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "1k3d68_dyn.engine")
-    det_engine = sys.argv[2] if len(sys.argv) > 2 else os.path.join(root, "scrfd_500m_bnkps_batch32.engine")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
+    engine = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "models", "pose68", "1k3d68_dyn.engine")
+    det_engine = sys.argv[2] if len(sys.argv) > 2 else os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps_batch32.engine")
     img_path = sys.argv[3] if len(sys.argv) > 3 else os.path.join(root, "_test", "frame_zhao_yi_lin_010.jpg")
 
-    from face_det import SCRFDTRTDetector, estimate_pose
+    sys.path.insert(0, root)
+    from src.face_det import SCRFDTRTDetector, estimate_pose
 
     det = SCRFDTRTDetector(det_engine, max_batch=4, conf_thres=0.5)
     p68 = FacePose68(engine)

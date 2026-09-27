@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Build a dynamic-batch TensorRT engine for the head detector (head2/model.onnx).
+Build a dynamic-batch TensorRT engine for the head detector (models/head/model.onnx).
 
 - head2 是单类 head 的 YOLO11l ONNX, 输入 640x640, 全部 Transpose batch 安全,
   无需 build_engine.py 里 SCRFD 专用的 Transpose perm 修复 / onnx reshape
@@ -10,7 +10,7 @@ Build a dynamic-batch TensorRT engine for the head detector (head2/model.onnx).
 Usage:
     python build_head_engine.py [onnx_path] [engine_path]
 
-默认: head2/model.onnx -> head2/model_dyn.engine
+默认: models/head/model.onnx -> models/head/model_dyn.engine
 """
 import os
 import sys
@@ -64,7 +64,7 @@ def build(onnx_path, engine_path):
 
 
 if __name__ == "__main__":
-    root = os.path.dirname(os.path.abspath(__file__))
-    onnx_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "head2", "model.onnx")
-    engine_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(root, "head2", "model_dyn.engine")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
+    onnx_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "models", "head", "model.onnx")
+    engine_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(root, "models", "head", "model_dyn.engine")
     build(onnx_path, engine_path)

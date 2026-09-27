@@ -28,8 +28,8 @@ from pycuda.gpuarray import GPUArray
 
 INPUT_SIZE = 448
 
-DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "resnet34_gaze.engine")
+DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "models", "gaze", "resnet34_gaze.engine")
 
 
 class GazeResNet:

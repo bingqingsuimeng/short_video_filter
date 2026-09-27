@@ -571,8 +571,8 @@ def estimate_pose(kps, box):
 # ---------------- self test ----------------
 if __name__ == "__main__":
     import sys
-    root = os.path.dirname(os.path.abspath(__file__))
-    engine = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "scrfd_500m_bnkps_batch32.engine")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
+    engine = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps_batch32.engine")
     img_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(root, "_test", "frame_zhao_yi_lin_010.jpg")
 
     det = SCRFDTRTDetector(engine)

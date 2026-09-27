@@ -7,9 +7,9 @@ head_gate.py — Stage1.5 人头检测闸门（head2 单类 head，TensorRT）
 自拍单帧主角只有 1 个头，冒出第 2 个头即画面里还有别人。
 
 引擎（默认优先动态 batch 引擎）:
-  head2/model_dyn.engine  输入 images (batch,3,640,640) fp32 NCHW RGB,
+  models/head/model_dyn.engine  输入 images (batch,3,640,640) fp32 NCHW RGB,
                           profile min=1/opt=16/max=32（TRT 11 无全局 FP16 flag → FP32）
-  head2/model.engine      旧固定 batch=1 引擎（dyn 缺失时自动回退）
+  models/head/model.engine      旧固定 batch=1 引擎（dyn 缺失时自动回退）
   输出: (batch,5,8400) fp32 = cx, cy, w, h (640 输入像素), conf (已 sigmoid)
 预处理: BGR→RGB → 保持宽高比居中 letterbox 到 640×640 (pad 值 114) → /255 → NCHW
 解码:   conf>=阈值 → cxcywh→xyxy → 减 pad 除 scale 映射回原图 → NMS(IoU 0.6)
@@ -34,7 +34,8 @@ from pycuda.gpuarray import GPUArray
 _S = 640
 _NMS_IOU = 0.6
 _OUT_C, _OUT_HW = 5, 8400   # 输出 (batch, 5, 8400)
-_HEAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "head2")
+_HEAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "models", "head")
 _DYN_ENGINE = os.path.join(_HEAD_DIR, "model_dyn.engine")
 _LEGACY_ENGINE = os.path.join(_HEAD_DIR, "model.engine")
 

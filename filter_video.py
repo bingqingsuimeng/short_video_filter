@@ -58,8 +58,8 @@ import numpy as np
 import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from face_det import SCRFDTRTDetector, estimate_pose
-from face_pose68 import FacePose68
+from src.face_det import SCRFDTRTDetector, estimate_pose
+from src.face_pose68 import FacePose68
 
 
 # ---------------- helpers ----------------
@@ -158,14 +158,14 @@ class VideoFilter:
         self.gaze = None
         if gaze_model == "resnet34":
             try:
-                from gaze_resnet import GazeResNet
+                from src.gaze_resnet import GazeResNet
                 self.gaze = GazeResNet(gaze_model_path)
                 print(f"[filter] Stage2 眼神闸门 = resnet34 ({self.gaze.ep})")
             except Exception as e:
                 print(f"[filter] !! 眼神闸门(resnet34)加载失败，Stage2 关闭: {e}")
         elif gaze_max is not None and gaze_max > 0:
             try:
-                from face_gaze import GazeGate
+                from src.face_gaze import GazeGate
                 self.gaze = GazeGate()
             except Exception as e:
                 print(f"[filter] !! 眼神闸门加载失败，Stage2 关闭: {e}")
@@ -174,7 +174,7 @@ class VideoFilter:
         self.head = None
         if head_on:
             try:
-                from head_gate import HeadGate
+                from src.head_gate import HeadGate
                 self.head = HeadGate(head_model_path, conf_thresh=head_conf)
                 print(f"[filter] 人头闸门 = head2 (TensorRT) conf={head_conf}")
             except Exception as e:
@@ -598,7 +598,7 @@ def main():
                          "with a directory input an explicit --out-dir is shared by ALL videos)")
     ap.add_argument("--engine", default=None)
     ap.add_argument("--pose-engine", default=None,
-                    help="1k3d68 68 点 3D 姿态 TRT 引擎（默认脚本同目录 1k3d68_dyn.engine；"
+                    help="1k3d68 68 点 3D 姿态 TRT 引擎（默认 models/pose68/1k3d68_dyn.engine；"
                          "缺失则回退 SCRFD 5 点 solvePnP）")
     ap.add_argument("--conf", type=float, default=0.8, help="face confidence threshold")
     ap.add_argument("--yaw", type=float, default=12.0,
@@ -618,7 +618,7 @@ def main():
                          "阈值 --gaze-pitch-max/--gaze-yaw-max，度）；iris=MediaPipe 虹膜偏移"
                          "（阈值 --gaze-max，备选）")
     ap.add_argument("--gaze-model-path", default=None,
-                    help="resnet34 模型路径（默认 <项目目录>/resnet34_gaze.onnx）")
+                    help="resnet34 TRT 引擎路径（默认 models/gaze/resnet34_gaze.engine）")
     ap.add_argument("--gaze-pitch-max", type=float, default=15.0,
                     help="resnet34 纵向注视角上限（度）：|pitch|>此值剔除（文档 attention 阈值 15°；"
                          "高/低机位下绝对 pitch 会漂移，主要靠 --gaze-dy-dev 基线闸门兜底）")
@@ -641,8 +641,8 @@ def main():
     ap.add_argument("--head-conf", type=float, default=0.30,
                     help="人头检测置信度阈值（head2，默认 0.30，实测最稳误检最少）")
     ap.add_argument("--head-model-path", default=None,
-                    help="head2 TRT engine 路径（默认 <项目目录>/head2/model_dyn.engine，"
-                         "缺失回退 model.engine）")
+                    help="head2 TRT engine 路径（默认 models/head/model_dyn.engine，"
+                         "缺失回退 models/head/model.engine）")
     ap.add_argument("--image-dir", default=None,
                     help="纯图片文件夹模式（显式指定, 永远优先）: 只跑人头闸门, "
                          "nheads>=2 剔除; 输出 kept 图硬链接 + REPORT.csv + dropped.txt, "
@@ -675,7 +675,7 @@ def main():
     if image_dir is not None:
         if args.no_head_gate:
             sys.exit("[image-dir] 图片模式只依赖人头闸门, 与 --no-head-gate 冲突")
-        from head_gate import HeadGate
+        from src.head_gate import HeadGate
         head = HeadGate(args.head_model_path, conf_thresh=args.head_conf)
         out_dir = args.out_dir or (os.path.normpath(image_dir) + "_head")
         process_image_dir(image_dir, out_dir, head, batch=args.batch,
@@ -686,10 +686,10 @@ def main():
         ap.error("需要 input（视频/视频目录）或 --image-dir（纯图片目录）")
 
     root = os.path.dirname(os.path.abspath(__file__))
-    engine = args.engine or os.path.join(root, "scrfd_500m_bnkps_batch32.engine")
+    engine = args.engine or os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps_batch32.engine")
     if not os.path.exists(engine):
         sys.exit(f"engine not found: {engine}")
-    pose_engine = args.pose_engine or os.path.join(root, "1k3d68_dyn.engine")
+    pose_engine = args.pose_engine or os.path.join(root, "models", "pose68", "1k3d68_dyn.engine")
 
     # build explicit (video_path, out_dir) targets — avoids double-appending the suffix
     shared_csv = False

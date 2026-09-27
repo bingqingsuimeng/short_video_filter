@@ -52,6 +52,6 @@ def build(onnx_path, engine_path, fp16=True):
 
 
 if __name__ == "__main__":
-    root = os.path.dirname(os.path.abspath(__file__))
-    build(sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "resnet34_gaze.onnx"),
-          sys.argv[2] if len(sys.argv) > 2 else os.path.join(root, "resnet34_gaze.engine"))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
+    build(sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "models", "gaze", "resnet34_gaze.onnx"),
+          sys.argv[2] if len(sys.argv) > 2 else os.path.join(root, "models", "gaze", "resnet34_gaze.engine"))

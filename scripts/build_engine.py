@@ -102,10 +102,11 @@ def build(onnx_path, engine_path, fp16=True):
 
 
 if __name__ == "__main__":
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
     onnx_path = sys.argv[1] if len(sys.argv) > 1 else (
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "scrfd_500m_bnkps.onnx"))
+        os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps.onnx"))
     engine_path = sys.argv[2] if len(sys.argv) > 2 else (
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "scrfd_500m_bnkps_fp16_batch32.engine"))
+        os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps_batch32.engine"))
     tmp_reshaped = engine_path + ".reshaped.onnx"
     reshape_onnx(onnx_path, tmp_reshaped)
     build(tmp_reshaped, engine_path, fp16=True)
