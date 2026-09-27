@@ -53,7 +53,7 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 | SCRFD-500m(人脸检测 + 5 关键点) | `models/scrfd/scrfd_500m_bnkps.onnx` | ~2.4 MB | **公开**,insightface SCRFD | `models/scrfd/scrfd_500m_bnkps_batch32.engine`(动态 batch 1/16/32,640×640) | `python scripts/build_engine.py`(默认即上述路径,也可显式传 `onnx engine`) |
 | 1k3d68(68 点 3D 姿态) | `models/pose68/1k3d68.onnx` | ~137 MB | **公开**(1k3d68 项目) | `models/pose68/1k3d68_dyn.engine`(动态 batch) | 由 `models/pose68/1k3d68.onnx` 按 `scripts/build_engine.py` 中 `build()` 的动态 batch profile 模式构建(解析网络 + `set_shape` min/opt/max + `build_serialized_network`) |
 | Gaze ResNet34(视线 pitch/yaw,448×448) | `models/gaze/resnet34_gaze.onnx` | ~81 MB | **自训**(yakhyo MobileGaze / uniface 类训练) | `models/gaze/resnet34_gaze.engine`(batch1,448×448) | `python scripts/build_gaze_engine.py`(默认即上述路径) |
-| Head YOLO11l(人头检测,单类 head,640×640) | `models/head/model.onnx` | ~101 MB | **自训**(real_head_yolo) | `models/head/model_dyn.engine`(动态 batch 1/16/32);另 `models/head/model.engine` 为 batch1 固定版,`model_dyn.engine` 缺失时自动回退 | `python scripts/build_head_engine.py`(默认建 `models/head/model_dyn.engine`) |
+| Head YOLO11l(人头检测,单类 head,640×640) | `models/head/model.onnx` | ~101 MB | **自训**(real_head_yolo) | 默认 `models/head/model_dyn_fp16.engine`(FP16,动态 batch 1/16/32,IO fp32);缺失时自动回退 FP32 `models/head/model_dyn.engine`,再回退 batch1 固定版 `models/head/model.engine` | `python scripts/build_head_engine.py --fp16`(建 FP16 默认引擎);`python scripts/build_head_engine.py`(默认建 FP32 `model_dyn.engine`) |
 
 > **重要:gaze(`models/gaze/resnet34_gaze.onnx`)与 head(`models/head/model.onnx`)两个 ONNX 是自训模型,不在任何公开源,克隆本仓库后需自行放置到上述路径。**
 
@@ -61,7 +61,7 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 - `scripts/build_engine.py` — SCRFD 专用:先把 ONNX 输入改写成动态 batch `[-1,3,640,640]`,并修复导出时的 head Transpose perm 问题(SCRFD ONNX 专有的 bug,其它模型不需要),再按 min=1/opt=16/max=32 profile 建引擎。
 - `scripts/build_gaze_engine.py` — resnet34 onnx 本身固定 batch=1,直接建即可。
-- `scripts/build_head_engine.py` — head2 onnx 的 Transpose 全部 batch 安全,无需 reshape,直接按 min=1/opt=16/max=32 profile 建动态 batch 引擎。
+- `scripts/build_head_engine.py` — head2 onnx 的 Transpose 全部 batch 安全,无需 reshape,直接按 min=1/opt=16/max=32 profile 建动态 batch 引擎。默认建 FP32 `model_dyn.engine`;加 `--fp16` 先把 ONNX 转 FP16 混合精度(图 IO 保持 fp32,中间产物 `models/head/model_fp16.onnx` 保留)再建 `models/head/model_dyn_fp16.engine`。
 - 三个脚本都是 TRT 11 风格:`Logger(WARNING)` + `set_memory_pool_limit(WORKSPACE, 1<<30)`,无全局 FP16 flag(自动/逐层精度)。
 
 可选:`preproc_kernel.cubin` 是 `preproc_kernel.cu`(SCRFD letterbox 预处理 CUDA 核)的编译产物,用 `nvcc -cubin preproc_kernel.cu` 可重编;**缺失时 `face_det` 自动回退 CPU 预处理**,不影响正确性。
@@ -77,7 +77,7 @@ python filter_video.py <video.mp4> --gaze-dy-dev 11
 常用参数(默认值均已在 `filter_video.py` argparse 中,上面表格为主):
 
 - `--out-dir <dir>`:输出目录。默认:单个文件 → `<input所在目录>/<stem>_kept`;目录输入(多视频)→ `<input目录>/kept_frames/<stem>_kept`,多视频共享同一 `--out-dir` 时 CSV 按视频名区分(`pose_report_<stem>.csv`)防覆盖
-- `--engine` / `--pose-engine` / `--gaze-model-path` / `--head-model-path`:各模型 TRT 引擎路径。默认:仓库根 `models/scrfd/scrfd_500m_bnkps_batch32.engine` / `models/pose68/1k3d68_dyn.engine` / `models/gaze/resnet34_gaze.engine` / `models/head/model_dyn.engine`(缺 dyn 回退 `models/head/model.engine`)
+- `--engine` / `--pose-engine` / `--gaze-model-path` / `--head-model-path`:各模型 TRT 引擎路径。默认:仓库根 `models/scrfd/scrfd_500m_bnkps_batch32.engine` / `models/pose68/1k3d68_dyn.engine` / `models/gaze/resnet34_gaze.engine` / `models/head/model_dyn_fp16.engine`(缺 FP16 按 `model_dyn.engine` → `model.engine` 逐级回退)
 - `--batch 16`:SCRFD 检测 batch(≤32);`--detect-chunk 64`:每次 detect() 的帧数
 - `--max-fps 10.0`:源视频 fps 高于此值时按此 fps 均匀抽帧解码(0=关);`--target-long 768`:检测前 downscale 长边(0=关)
 - `--no-head-gate`:关闭 Stage1.5 人头闸门(默认开)
@@ -98,6 +98,7 @@ python filter_video.py --image-dir <图片目录> --out-dir <输出目录>
 - **只数 NMS 后的 head 总数:`≥2 头 = 画面里含他人 → 整帧丢弃**;
 - 只在「其它闸门全过 + 恰好检出 1 张人脸」时触发,避免空转;
 - **强后果:人流 / 景点密集视频可能整段 kept=0** —— 这是项目已接受的决策(要「单人」帧,宁缺毋滥)。
+- 默认 FP16 引擎实测:纯推理 batch16 较 FP32 提速 ~2.8×,100 张分层抽样对比 kept/dropped 判定 100% 一致。
 
 ## 输出
 
@@ -125,12 +126,14 @@ short_video_filter/
 │   ├── scrfd/               # scrfd_500m_bnkps.onnx / scrfd_500m_bnkps_batch32.engine(+ .reshaped.onnx)
 │   ├── pose68/              # 1k3d68.onnx / 1k3d68_dyn.engine
 │   ├── gaze/                # resnet34_gaze.onnx / resnet34_gaze.engine
-│   └── head/                # model.onnx / model_dyn.engine / model.engine /
+│   └── head/                # model.onnx / model_dyn_fp16.engine(默认,FP16) /
+│                            #   model_dyn.engine(FP32 回退) / model.engine(batch1 回退) /
+│                            #   model_fp16.onnx(--fp16 中间产物) /
 │                            #   threshold.json(head 训练 F1 最优阈值参考, 运行时用 0.30)
 ├── scripts/                 # 引擎构建 + 环境脚本
 │   ├── build_engine.py      # SCRFD 动态 batch 引擎构建(含 Transpose 修复)
 │   ├── build_gaze_engine.py # resnet34 引擎构建
-│   ├── build_head_engine.py # head2 动态 batch 引擎构建(min1/opt16/max32)
+│   ├── build_head_engine.py # head2 动态 batch 引擎构建(min1/opt16/max32, --fp16 混合精度)
 │   ├── setup_cuda_trt.ps1   # CUDA 13.1 + TRT 11.3 路径写入 Windows 用户环境(一次性)
 │   └── verify_cuda_trt.ps1  # 验证 import tensorrt / 驱动是否就绪
 ├── data/                    # 旧 CLIP 项目逐人结果记录(*_checkpoint.json, 留本地, git 忽略)

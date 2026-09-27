@@ -6,10 +6,13 @@ head_gate.py — Stage1.5 人头检测闸门（head2 单类 head，TensorRT）
 画面里 NMS 后 head 总数 >= 2（含主角的头）→ 判 multi_head 丢弃。
 自拍单帧主角只有 1 个头，冒出第 2 个头即画面里还有别人。
 
-引擎（默认优先动态 batch 引擎）:
-  models/head/model_dyn.engine  输入 images (batch,3,640,640) fp32 NCHW RGB,
-                          profile min=1/opt=16/max=32（TRT 11 无全局 FP16 flag → FP32）
-  models/head/model.engine      旧固定 batch=1 引擎（dyn 缺失时自动回退）
+引擎（默认优先 FP16 动态 batch，按存在性逐级回退）:
+  models/head/model_dyn_fp16.engine  FP16 动态 batch（IO 保持 fp32，
+                          由 scripts/build_head_engine.py --fp16 构建）
+  models/head/model_dyn.engine       FP32 动态 batch（FP16 缺失时回退；
+                          TRT 11 无全局 FP16 flag → 全 FP32）
+  models/head/model.engine           旧固定 batch=1 引擎（dyn 缺失时再回退）
+  共同输入 images (batch,3,640,640) fp32 NCHW RGB, profile min=1/opt=16/max=32
   输出: (batch,5,8400) fp32 = cx, cy, w, h (640 输入像素), conf (已 sigmoid)
 预处理: BGR→RGB → 保持宽高比居中 letterbox 到 640×640 (pad 值 114) → /255 → NCHW
 解码:   conf>=阈值 → cxcywh→xyxy → 减 pad 除 scale 映射回原图 → NMS(IoU 0.6)
@@ -36,13 +39,19 @@ _NMS_IOU = 0.6
 _OUT_C, _OUT_HW = 5, 8400   # 输出 (batch, 5, 8400)
 _HEAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "models", "head")
+_FP16_ENGINE = os.path.join(_HEAD_DIR, "model_dyn_fp16.engine")
 _DYN_ENGINE = os.path.join(_HEAD_DIR, "model_dyn.engine")
 _LEGACY_ENGINE = os.path.join(_HEAD_DIR, "model.engine")
+_DEFAULT_ENGINES = (_FP16_ENGINE, _DYN_ENGINE, _LEGACY_ENGINE)
 
 
 def _default_engine_path():
-    """优先动态 batch 引擎 model_dyn.engine，缺失回退固定 batch=1 的 model.engine。"""
-    return _DYN_ENGINE if os.path.exists(_DYN_ENGINE) else _LEGACY_ENGINE
+    """默认引擎优先级: FP16 动态 batch → FP32 动态 batch → 固定 batch=1，
+    按存在性逐级回退。"""
+    for p in _DEFAULT_ENGINES:
+        if os.path.exists(p):
+            return p
+    return _DEFAULT_ENGINES[0]
 
 
 # 兼容旧引用
