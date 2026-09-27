@@ -39,10 +39,13 @@ _T = onnx.TensorProto
 _INT = {_T.INT32, _T.INT64}
 
 
-def _target_input_type(op, k):
+def _target_input_type(op, k, protected=False):
     """节点第 k 个浮点输入的目标精度:
+    被保护节点(混合精度细化: 该算子留 fp32)全部浮点输入 fp32;
     Range(opset<=16 无 fp16 实现)全部输入、Resize 的 scales(2)/sizes(3)
     按 ONNX 规格必须 fp32, 其余一律 fp16。"""
+    if protected:
+        return _T.FLOAT
     if op == "Range":
         return _T.FLOAT
     if op == "Resize" and k in (2, 3):
@@ -50,9 +53,19 @@ def _target_input_type(op, k):
     return _T.FLOAT16
 
 
-def _fp32_slot_tensors(g):
-    """必须保持 fp32 的输入槽对应的张量集合(权重转换步骤据此跳过)。"""
+def _protected_nodes(g, fp32_ops=None, fp32_nodes=None):
+    """需保留 fp32 的节点名集合: 按算子类型(fp32_ops)或节点名(fp32_nodes)。"""
+    fp32_ops = set(fp32_ops or ())
+    fp32_nodes = set(fp32_nodes or ())
+    return {n.name for n in g.node
+            if n.op_type in fp32_ops or n.name in fp32_nodes}
+
+
+def _fp32_slot_tensors(g, prot=()):
+    """必须保持 fp32 的输入槽对应的张量集合(权重转换步骤据此跳过):
+    Range 全部输入 / Resize scales / 被保护节点的浮点输入(权重/常量)。"""
     tensors = set()
+    const_out = {o for n in g.node if n.op_type == "Constant" for o in n.output}
     for n in g.node:
         if n.op_type == "Range":
             tensors.update(n.input)
@@ -60,11 +73,14 @@ def _fp32_slot_tensors(g):
             for k in (2, 3):
                 if k < len(n.input) and n.input[k]:
                     tensors.add(n.input[k])
+        elif n.name in prot:
+            tensors.update(t for t in n.input if t)
     return tensors
 
 
-def _infer_types(g):
-    """本模型算子集上的前向类型推断, 返回 {tensor_name: elem_type}。"""
+def _infer_types(g, prot=()):
+    """本模型算子集上的前向类型推断, 返回 {tensor_name: elem_type}。
+    prot 中被保护节点的输出按 fp32 计(其输入会被插入 Cast 成 fp32)。"""
     types = {}
     for t in g.input:
         types[t.name] = t.type.tensor_type.elem_type
@@ -95,11 +111,17 @@ def _infer_types(g):
                 types[n.output[0]] = types.get(n.input[0], _T.FLOAT)
         elif op in ("Conv", "MatMul", "Split", "Gather", "Resize", "Concat",
                     "Expand", "Slice", "MaxPool", "Reshape", "Unsqueeze",
-                    "Transpose", "Sigmoid", "Softmax", "Add", "Mul", "Sub",
-                    "Div", "Flatten", "Identity"):
+                    "Transpose", "Sigmoid", "Softmax", "Relu", "Add", "Mul",
+                    "Sub", "Div", "Flatten", "Identity",
+                    "BatchNormalization", "Gemm", "GlobalAveragePool"):
+            # BatchNormalization(1k3d68 52 个): 输出 dtype = data(第一个输入);
+            # Gemm(1k3d68 1 个, alpha/beta 为标量属性): 输出 dtype = X(第一个输入)
             # 输出类型 = 主输入(第一个)类型; 全 int 输入(如 int64 Gather/
             # Reshape shape 运算)不得回退成 float
-            base = types.get(n.input[0], _T.FLOAT) if n.input else _T.FLOAT
+            if n.name in prot:
+                base = _T.FLOAT
+            else:
+                base = types.get(n.input[0], _T.FLOAT) if n.input else _T.FLOAT
             for o in n.output:
                 types[o] = base
         else:
@@ -107,7 +129,7 @@ def _infer_types(g):
     return types
 
 
-def convert_onnx_to_fp16(onnx_path, out_path):
+def convert_onnx_to_fp16(onnx_path, out_path, fp32_ops=None, fp32_nodes=None):
     """FP32 ONNX -> FP16 混合精度 ONNX。
 
     语义等价于 modelopt.onnx.autocast.convert_to_mixed_precision(
@@ -116,22 +138,36 @@ def convert_onnx_to_fp16(onnx_path, out_path):
     类型驱动统一为 fp16 —— 对每个节点, 浮点输入类型与节点目标精度
     (Range 必须 fp32, 其余 fp16)不一致的边自动插 Cast。
     返回输出路径。
+
+    混合精度细化保护(fp32_ops / fp32_nodes, 默认全关, 不影响原有行为):
+    指定算子类型(如 "Gemm")或节点名(如 "fc1")的节点保留 fp32 计算——
+    其浮点输入(Cast 成 fp32 后进节点)、权重/常量(不转 fp16)均按 fp32,
+    输出 fp32, 若下游是 fp16 节点则自动插 Cast 回 fp16, 全图 fp16 骨架
+    与 IO fp32 不变。用途: 回归头(如 1k3d68 的 fc1 Gemm)的 fp16 舍入
+    会让 landmark 产生系统性亚像素偏差, 在 EAR 这类"小距离相除"指标上
+    被放大, 把关键算子单独留 fp32 即可消除。指定保护时不走 modelopt
+    autocast 路径(其不支持逐节点精度), 用内置实现。
     """
-    # 首选官方 ModelOpt AutoCast(若环境装了 nvidia-modelopt)
-    try:
-        import modelopt.onnx.autocast as autocast
-        converted = autocast.convert_to_mixed_precision(
-            onnx_path, low_precision_type="fp16", keep_io_types=True)
-        onnx.save(converted, out_path)
-        print(f"[fp16] 转换完成(modelopt.onnx.autocast) -> {out_path}")
-        return out_path
-    except ImportError:
-        pass
+    # 首选官方 ModelOpt AutoCast(若环境装了 nvidia-modelopt 且无逐节点保护)
+    if not (fp32_ops or fp32_nodes):
+        try:
+            import modelopt.onnx.autocast as autocast
+            converted = autocast.convert_to_mixed_precision(
+                onnx_path, low_precision_type="fp16", keep_io_types=True)
+            onnx.save(converted, out_path)
+            print(f"[fp16] 转换完成(modelopt.onnx.autocast) -> {out_path}")
+            return out_path
+        except ImportError:
+            pass
 
     # 内置 onnx cast: 与 autocast(keep_io_types=True) 同语义
     model = onnx.load(onnx_path)
     g = model.graph
-    keep_f32 = _fp32_slot_tensors(g)
+    prot = _protected_nodes(g, fp32_ops, fp32_nodes)
+    if prot:
+        print(f"[fp16] fp32 保护节点 {len(prot)} 个: "
+              f"{sorted(prot)[:12]}{' ...' if len(prot) > 12 else ''}")
+    keep_f32 = _fp32_slot_tensors(g, prot)
 
     # 1) 全部 float 权重 / Constant 常量 -> fp16(规格要求 fp32 的槽位
     #    对应张量跳过, 如 Resize scales)
@@ -166,13 +202,13 @@ def convert_onnx_to_fp16(onnx_path, out_path):
     #    其输出才成为 fp32), 一轮推断不够
     n_edge = 0
     for _ in range(8):
-        types = _infer_types(g)
+        types = _infer_types(g, prot)
         inserted = 0
         for n in list(g.node):
             if n.op_type == "Cast":
                 continue
             for k, s in enumerate(n.input):
-                target = _target_input_type(n.op_type, k)
+                target = _target_input_type(n.op_type, k, n.name in prot)
                 t = types.get(s)
                 if t in (_T.FLOAT, _T.FLOAT16) and t != target:
                     c = f"__cast{n_edge}_{s}"
@@ -186,8 +222,8 @@ def convert_onnx_to_fp16(onnx_path, out_path):
         if inserted == 0:
             break
 
-    # 4) 图输出为 fp16 时末尾插 fp16->fp32 Cast
-    types = _infer_types(g)
+    # 4) 图输出为 fp16 时末尾插 fp16->fp32 Cast(保护节点产出 fp32 则直接是图输出)
+    types = _infer_types(g, prot)
     producers = {}
     for n in g.node:
         for o in n.output:
@@ -205,7 +241,7 @@ def convert_onnx_to_fp16(onnx_path, out_path):
 
     # 5) 清掉原图 value_info(旧 fp32 类型标注, 会与新连线冲突), 终检
     del g.value_info[:]
-    types2 = _infer_types(g)
+    types2 = _infer_types(g, prot)
     bad = []
     for n in g.node:
         if n.op_type == "Range" and types2.get(n.output[0]) != _T.FLOAT:

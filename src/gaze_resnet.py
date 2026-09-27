@@ -28,8 +28,23 @@ from pycuda.gpuarray import GPUArray
 
 INPUT_SIZE = 448
 
-DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                             "models", "gaze", "resnet34_gaze.engine")
+_GAZE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "models", "gaze")
+_FP16_MODEL = os.path.join(_GAZE_DIR, "resnet34_gaze_fp16.engine")
+_FP32_MODEL = os.path.join(_GAZE_DIR, "resnet34_gaze.engine")
+_DEFAULT_MODELS = (_FP16_MODEL, _FP32_MODEL)
+
+
+def _default_model_path():
+    """默认引擎优先级: FP16 → FP32，按存在性逐级回退。"""
+    for p in _DEFAULT_MODELS:
+        if os.path.exists(p):
+            return p
+    return _DEFAULT_MODELS[0]
+
+
+# 兼容旧引用（指向默认解析函数，不再是固定 FP32 路径）
+DEFAULT_MODEL = _default_model_path()
 
 
 class GazeResNet:
@@ -41,7 +56,7 @@ class GazeResNet:
 
     def __init__(self, model_path=None, providers=None):
         """model_path: 序列化 TRT 引擎路径；providers 参数仅为兼容旧调用，忽略。"""
-        model_path = model_path or DEFAULT_MODEL
+        model_path = model_path or _default_model_path()
         if not os.path.exists(model_path):
             raise FileNotFoundError(
                 f"未找到 TRT 引擎 {model_path}，请先运行 build_gaze_engine.py 构建")

@@ -572,7 +572,15 @@ def estimate_pose(kps, box):
 if __name__ == "__main__":
     import sys
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
-    engine = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps_batch32.engine")
+    if len(sys.argv) > 1:
+        engine = sys.argv[1]
+    else:
+        # 默认引擎优先级: FP16 动态 batch → FP32 动态 batch，按存在性逐级回退
+        _candidates = (
+            os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps_batch32_fp16.engine"),
+            os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps_batch32.engine"),
+        )
+        engine = next((p for p in _candidates if os.path.exists(p)), _candidates[0])
     img_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(root, "_test", "frame_zhao_yi_lin_010.jpg")
 
     det = SCRFDTRTDetector(engine)

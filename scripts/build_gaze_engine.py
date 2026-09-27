@@ -8,7 +8,15 @@ Build a TensorRT engine for resnet34_gaze.onnx (yakhyo MobileGaze / uniface).
 
 Usage:
     python build_gaze_engine.py [onnx_path] [engine_path]
+    python build_gaze_engine.py --fp16
+
+默认: models/gaze/resnet34_gaze.onnx -> models/gaze/resnet34_gaze.engine(行为不变)
+--fp16: 先把 ONNX 转 FP16 混合精度(图 IO 保持 fp32, 复用
+        build_head_engine.convert_onnx_to_fp16)再建
+        models/gaze/resnet34_gaze_fp16.engine
+        (中间产物 models/gaze/resnet34_gaze_fp16.onnx 保留以便复现)
 """
+import argparse
 import os
 import sys
 
@@ -52,6 +60,33 @@ def build(onnx_path, engine_path, fp16=True):
 
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("onnx_path", nargs="?", default=None)
+    ap.add_argument("engine_path", nargs="?", default=None)
+    ap.add_argument("--fp16", action="store_true",
+                    help="先把 ONNX 转 FP16 混合精度(IO 保持 fp32, 复用 "
+                         "build_head_engine.convert_onnx_to_fp16)再建引擎; "
+                         "默认引擎名改为 resnet34_gaze_fp16.engine")
+    args = ap.parse_args()
+
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
-    build(sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "models", "gaze", "resnet34_gaze.onnx"),
-          sys.argv[2] if len(sys.argv) > 2 else os.path.join(root, "models", "gaze", "resnet34_gaze.engine"))
+    onnx_path = args.onnx_path or os.path.join(root, "models", "gaze", "resnet34_gaze.onnx")
+    if args.engine_path:
+        engine_path = args.engine_path
+    elif args.fp16:
+        engine_path = os.path.join(root, "models", "gaze", "resnet34_gaze_fp16.engine")
+    else:
+        engine_path = os.path.join(root, "models", "gaze", "resnet34_gaze.engine")
+
+    if args.fp16:
+        # 与 build_pose_engine.py --fp16 同路径: 转图 -> 普通 build,
+        # 精度由 ONNX 图 dtype 决定(TRT 11 无全局 flag)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from build_head_engine import convert_onnx_to_fp16
+        fp16_onnx = os.path.splitext(onnx_path)[0] + "_fp16.onnx"
+        convert_onnx_to_fp16(onnx_path, fp16_onnx)
+        build(fp16_onnx, engine_path)
+    else:
+        # 无 flag: 与原脚本逐字节一致的 FP32 构建
+        build(onnx_path, engine_path)

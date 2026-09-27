@@ -7,8 +7,17 @@ Build a TensorRT engine for SCRFD-500m with 5-keypoint output.
 - Saves the serialized engine to disk
 
 Usage:
-    python build_engine.py [onnx_path] [engine_path]
+    python build_engine.py [onnx_path] [engine_path] [--fp16]
+
+默认(无 --fp16): 行为与旧版逐字节一致 —— reshape + 建 FP32 引擎到
+    models/scrfd/scrfd_500m_bnkps_batch32.engine
+--fp16: reshape 后先复用 build_head_engine.convert_onnx_to_fp16() 把 ONNX 转成
+    FP16 混合精度(图 IO 保持 fp32), 再按同一 profile 建引擎到
+    models/scrfd/scrfd_500m_bnkps_batch32_fp16.engine
+    (TRT 11 强类型网络: 精度由 ONNX 图张量 dtype 决定, 无全局 FP16 flag;
+    中间产物 models/scrfd/scrfd_500m_bnkps_batch32_fp16.onnx 保留以便复现)
 """
+import argparse
 import os
 import sys
 
@@ -56,7 +65,7 @@ def reshape_onnx(src, dst, size=INPUT_SIZE):
     return dst
 
 
-def build(onnx_path, engine_path, fp16=True):
+def build(onnx_path, engine_path, fp16=True, fp16_converted=False):
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
 
@@ -74,7 +83,11 @@ def build(onnx_path, engine_path, fp16=True):
     config = builder.create_builder_config()
     # 1 GiB workspace
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
-    if fp16 and hasattr(trt.BuilderFlag, "FP16"):
+    if fp16_converted:
+        # ONNX 图已是 FP16 混合精度(IO fp32): TRT 11 强类型网络精度取自图
+        # dtype, 无需也无法再设 flag
+        print("[build] ONNX already FP16 mixed precision -> precision from graph dtype")
+    elif fp16 and hasattr(trt.BuilderFlag, "FP16"):
         config.set_flag(trt.BuilderFlag.FP16)
         print("[build] FP16 enabled")
     else:
@@ -102,11 +115,34 @@ def build(onnx_path, engine_path, fp16=True):
 
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("onnx_path", nargs="?", default=None)
+    ap.add_argument("engine_path", nargs="?", default=None)
+    ap.add_argument("--fp16", action="store_true",
+                    help="先转 ONNX 为 FP16 混合精度(IO 保持 fp32, 复用 "
+                         "build_head_engine.convert_onnx_to_fp16)再建引擎到 "
+                         "scrfd_500m_bnkps_batch32_fp16.engine")
+    args = ap.parse_args()
+
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
-    onnx_path = sys.argv[1] if len(sys.argv) > 1 else (
+    onnx_path = args.onnx_path or (
         os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps.onnx"))
-    engine_path = sys.argv[2] if len(sys.argv) > 2 else (
-        os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps_batch32.engine"))
+    if args.engine_path:
+        engine_path = args.engine_path
+    elif args.fp16:
+        engine_path = os.path.join(root, "models", "scrfd",
+                                   "scrfd_500m_bnkps_batch32_fp16.engine")
+    else:
+        engine_path = os.path.join(root, "models", "scrfd",
+                                   "scrfd_500m_bnkps_batch32.engine")
     tmp_reshaped = engine_path + ".reshaped.onnx"
     reshape_onnx(onnx_path, tmp_reshaped)
-    build(tmp_reshaped, engine_path, fp16=True)
+    if args.fp16:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from build_head_engine import convert_onnx_to_fp16
+        fp16_onnx = os.path.splitext(engine_path)[0] + ".onnx"
+        convert_onnx_to_fp16(tmp_reshaped, fp16_onnx)
+        build(fp16_onnx, engine_path, fp16=True, fp16_converted=True)
+    else:
+        build(tmp_reshaped, engine_path, fp16=True)

@@ -596,7 +596,9 @@ def main():
                     help="output dir (default: <input_dir>/<stem>_kept for a file, "
                          "or <input_dir>/kept_frames/<stem>_kept for a directory; "
                          "with a directory input an explicit --out-dir is shared by ALL videos)")
-    ap.add_argument("--engine", default=None)
+    ap.add_argument("--engine", default=None,
+                    help="SCRFD TRT 引擎路径（默认 models/scrfd/scrfd_500m_bnkps_batch32_fp16.engine，"
+                         "缺失回退 scrfd_500m_bnkps_batch32.engine）")
     ap.add_argument("--pose-engine", default=None,
                     help="1k3d68 68 点 3D 姿态 TRT 引擎（默认 models/pose68/1k3d68_dyn.engine；"
                          "缺失则回退 SCRFD 5 点 solvePnP）")
@@ -614,11 +616,13 @@ def main():
                          "0=关闭）")
     ap.add_argument("--gaze-model", choices=["iris", "resnet34"], default="resnet34",
                     help="Stage2 眼神闸门实现（默认 resnet34，018/032/035 A/B 验证优于 iris）："
-                         "resnet34=yakhyo MobileGaze 全脸注视角（TRT，本地 resnet34_gaze.engine，"
+                         "resnet34=yakhyo MobileGaze 全脸注视角（TRT，本地 resnet34_gaze_fp16.engine，"
+                         "FP16 缺失回退 resnet34_gaze.engine；"
                          "阈值 --gaze-pitch-max/--gaze-yaw-max，度）；iris=MediaPipe 虹膜偏移"
                          "（阈值 --gaze-max，备选）")
     ap.add_argument("--gaze-model-path", default=None,
-                    help="resnet34 TRT 引擎路径（默认 models/gaze/resnet34_gaze.engine）")
+                    help="resnet34 TRT 引擎路径（默认 models/gaze/resnet34_gaze_fp16.engine，"
+                         "缺失回退 resnet34_gaze.engine）")
     ap.add_argument("--gaze-pitch-max", type=float, default=15.0,
                     help="resnet34 纵向注视角上限（度）：|pitch|>此值剔除（文档 attention 阈值 15°；"
                          "高/低机位下绝对 pitch 会漂移，主要靠 --gaze-dy-dev 基线闸门兜底）")
@@ -641,8 +645,8 @@ def main():
     ap.add_argument("--head-conf", type=float, default=0.30,
                     help="人头检测置信度阈值（head2，默认 0.30，实测最稳误检最少）")
     ap.add_argument("--head-model-path", default=None,
-                    help="head2 TRT engine 路径（默认 models/head/model_dyn.engine，"
-                         "缺失回退 models/head/model.engine）")
+                    help="head2 TRT engine 路径（默认 models/head/model_dyn_fp16.engine，"
+                         "缺失逐级回退 model_dyn.engine → model.engine）")
     ap.add_argument("--image-dir", default=None,
                     help="纯图片文件夹模式（显式指定, 永远优先）: 只跑人头闸门, "
                          "nheads>=2 剔除; 输出 kept 图硬链接 + REPORT.csv + dropped.txt, "
@@ -686,9 +690,19 @@ def main():
         ap.error("需要 input（视频/视频目录）或 --image-dir（纯图片目录）")
 
     root = os.path.dirname(os.path.abspath(__file__))
-    engine = args.engine or os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps_batch32.engine")
-    if not os.path.exists(engine):
-        sys.exit(f"engine not found: {engine}")
+    if args.engine:
+        engine = args.engine
+        if not os.path.exists(engine):
+            sys.exit(f"engine not found: {engine}")
+    else:
+        # 默认引擎优先级: FP16 动态 batch → FP32 动态 batch，按存在性逐级回退
+        _scrfd_candidates = (
+            os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps_batch32_fp16.engine"),
+            os.path.join(root, "models", "scrfd", "scrfd_500m_bnkps_batch32.engine"),
+        )
+        engine = next((p for p in _scrfd_candidates if os.path.exists(p)), _scrfd_candidates[0])
+        if not os.path.exists(engine):
+            sys.exit(f"engine not found: {engine}")
     pose_engine = args.pose_engine or os.path.join(root, "models", "pose68", "1k3d68_dyn.engine")
 
     # build explicit (video_path, out_dir) targets — avoids double-appending the suffix
