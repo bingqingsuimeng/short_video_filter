@@ -271,3 +271,351 @@ A 臂 = `--decode auto`(FFmpeg 管道);B 臂 = `--decode gpu` + monkeypatch 帧�
 3. 流水线只对「边解边读」的帧源(pynvvc/管道)生效;`--decode ffmpeg` 落盘路径解码在读取前已整体完成,保持旧行为(一行未改)。
 4. dedup 与流水线可叠加(已冒烟),但 dedup 路径的 head 仍走逐帧 `_gate_chain`(batch=1),dedup 场景的 head 收益要等 dedup 路径也接两阶段批量化。
 5. 本轮基准 e2e 噪声带 ±5~15%(受系统负载影响),分段耗时(尤其 head/decode)比墙钟稳;A/B 结论一律以同会话交替跑为准。
+
+## 10. 显存直通零拷贝集成(2026-09-29 第三轮,--decode pynvvc-gpu)
+
+### 10.0 结论摘要
+
+新增 `--decode pynvvc-gpu` 显存直通零拷贝臂:NVDEC device 帧(RGB)不落宿主,
+自研 CUDA kernel 在显存内逐位复刻宿主预处理(INTER_AREA 768 下采样、head 640
+定点 letterbox),再进**原版** preproc_kernel + **原版**引擎零拷贝推理。判定流水
+与宿主 pynvvc 臂逐行同逻辑。
+
+- **等价性:625/625 帧逐位一致**(9 项指标 |Δ|=0.0、JPG 名单一致、257 张 JPG
+  md5 逐字节一致)——连 §7.3 的 9 帧压线翻转都没有(结构性一致:送入引擎的
+  blob 与宿主臂逐字节相同,无阈值可漂)。
+- **e2e 16.30s → 13.42s(1.21x)**,逐视频 1.14~1.28x;解码+读帧段 21.3s(重叠假象)
+  → **8.60s(read=0)**;detect 1.37→0.39s(INTER_AREA 上 GPU+免 H2D)、
+  head 1.93→1.06s(letterbox 上 GPU+免 H2D)。
+- 主路径(SCRFD/head 的 blob)**无任何全帧 H2D**;宿主拷贝只剩「人脸帧落地 D2H」
+  (pose68/gaze/JPG 三个宿主消费者共同需要,JPG 落盘必须有宿主帧,不可避免)。
+- 不引入任何翻转引擎;旧三臂(管道/pynvvc 宿主/落盘)一行未改,新代码复跑宿主
+  pynvvc 臂与 §9 基线 625 帧逐位一致。
+
+### 10.1 改动内容
+
+| 文件 | 内容 |
+|---|---|
+| `src/gpu_decode_kernels.cu`(新)+ `.cubin` | 5 个 kernel:`area_fast_u8`(整数比 INTER_AREA,如 2160→432=5x,精确整数累加+RNE)、`area_generic_u8`(表驱动 INTER_AREA,如 1900x3378,复刻 computeResizeAreaTab double 建表+浮点累加次序,显式 `__fmul_rn/__fadd_rn` 禁 FMA)、`head_letterbox_u8`(640 居中 pad=114 定点 INTER_LINEAR,直写 fp32 blob)、`rgb2bgr_inplace_u8`、`copy_u8`。`nvcc -cubin -arch=sm_86 -fmad=false`;注释必须纯 ASCII(MSVC cp936 吞 UTF-8 注释换行)。**preproc_kernel.cu 未动** |
+| `src/gpu_decode.py`(新) | `_area_tab/area_path/AreaTables`(宿主 double 建表上传)、`GpuKernels`(ctypes cubin 加载/发射,与 face_det 同款)、`DeviceFramePool`(连续槽显存池,容量 chunk+8,块放不下整块回槽 0,保证块内物理连续)、`_PynvvcGpuSource`(useDeviceMemory=True 解码器与推理**共享同一条 pycuda 流**保序;选帧规则与 `_PynvvcSource` 完全一致;D2D=`memcpy_dtod_async`;EOF/断流守卫同款)、`scrfd_block_detect`/`head_slots_detect`(块级 device 直通) |
+| `filter_video.py` | `--decode` choices 加 `pynvvc-gpu`;`process()` 链 `("pynvvc-gpu","pynvvc","pipe","file")` + `--dedup` 时显式 WARNING 回退宿主 pynvvc;`__init__` 记录 `engine_path/_head_engine_path/_gpu`(3 行,无行为变化);`_ensure_gpu_arm`(懒建:自研流+cubin+显存池+**同引擎文件另建** device 版 SCRFD/head 实例,绑自研流)+ `_run_pass_gpu`(与 `_run_pass` 非 dedup 分支逐行同逻辑)。旧臂路径零修改 |
+
+实验铺路(`_test/post3_e1_resample_ab.py`、`post3_e2_resample_ref.py`、
+`post3_e3_kernel_ab.py`):E1 证明直改 letterbox 输入(链 B/C)blob 有
+~3.5 LSB 等效偏差、score 会漂 → 否决;定案「option B」= GPU 上逐位复刻
+cv2 INTER_AREA + 原引擎。E2 在 32 张真实 GT 帧上建立三条 Python 参考配方
+(与 cv2 逐字节一致)作 kernel 规格;E3 验证 kernel/共享流 D2D 保序/SCRFD
+端到端与宿主臂逐位一致(4 视频全 PASS)。
+
+### 10.2 数据流与拷贝点清单(零拷贝验证)
+
+```
+NVDEC RGB device 帧(解码器写帧与后续 kernel 同一条 CUDA 流,自动保序)
+  → [拷贝1] D2D 整帧入显存池(设备侧↔设备侧,不过 PCIe,不过宿主)
+  → [0拷贝] area_fast/generic kernel 池内直读 → 768 BGR 小图(显存)
+  → [0拷贝] 现役 preproc_kernel letterbox 768→640 blob(显存,原核未改)
+  → [0拷贝] SCRFD 引擎 set_tensor_address 就地推理 → 输出 D2H(9 小张量)
+  → 人脸帧: rgb2bgr_inplace kernel(池内) → [拷贝2] 同步 D2H 整帧落地(宿主)
+  → pose68 / gaze(宿主裁脸) / cv2.imwrite 用宿主 BGR 帧(与宿主臂同输入)
+  → head 帧: head_letterbox kernel 池内直读(已 BGR)→ [0拷贝] 写 head.in_dev
+    fp32 blob → 原宿主 head 引擎就地执行 → 输出 D2H(5x8400 小张量)
+```
+
+| # | 拷贝 | 方向 | 范围 | 说明 |
+|---|---|---|---|---|
+| 1 | D2D 池拷贝 | 设备→设备 | 全部选中帧(625) | 唯一整帧设备侧拷贝;显存带宽 ~330GB/s,4K 帧仅 ~0.15ms |
+| 2 | 人脸帧落地 D2H | 设备→宿主 | 仅人脸帧(508/625:006 89/099 96/154 189/214 134) | 由 pose68+gaze+imwrite 三个宿主消费者共同需要;JPG 落盘必须有宿主帧,不可避免;非 gaze 单独引入 |
+| 3 | TRT 输出 D2H | 设备→宿主 | 每批 9 小张量 / 5x8400 | 与宿主臂同 |
+| 4 | pose68/gaze 脸部裁剪 H2D | 宿主→设备 | 仅人脸帧 ROI | 与宿主臂完全相同(宿主消费者,不在本臂改动范围) |
+| — | SCRFD/head 图像数据 H2D | — | **无** | 宿主臂此处有 768 小图/640 blob 的 H2D,本臂全部消除 |
+
+显存占用(4K):池 72 槽 x 24.9MB ≈ 1.75GB + 768 小图 64MB + 引擎缓冲,
+合计 < 2.2GB(RTX 3060 12GB 内充裕)。
+
+### 10.3 等价性(625 帧,全部逐位一致;`equiv_zerocopy_vs_final_pnv.json`)
+
+| 对比 | 结果 |
+|---|---|
+| device 臂(zerocopy) vs 宿主 pynvvc 臂(§9 final_pnv) | **625/625 帧判定一致、9 项指标 |Δ|=0.0、JPG 名单一致、257 张 JPG md5 逐字节一致;§7.3 的 9 帧压线帧全部无翻转(零漂移,结构性等价)** |
+| 旧臂未受影响验证:新代码宿主 pynvvc 臂复跑(hostcheck) vs §9 基线 | 625/625 帧判定一致、9 项指标 |Δ|=0.0、JPG 名单一致( additions 零影响) |
+| 回退链 F1:device 臂初始化失败(monkeypatch) | WARNING + 回退宿主 pynvvc 重跑,006 结果 105/0 与直接 pynvvc 一致(`_test/post3_fallback_check.py`) |
+| 回退链 F2:表外帧率假 fps=24 | pynvvc-gpu → pynvvc → 管道 逐级 WARNING,最终 pipe 结果 105/0 一致 |
+| F3:`--decode pynvvc-gpu --dedup`(CLI) | 显式 WARNING「不支持 --dedup,回退 pynvvc 宿主帧源」,dedup 正常产出 |
+
+### 10.4 耗时对比(r1 口径:单进程一臂 4 视频、引擎加载单列)
+
+| 口径 | §9 最终(宿主 pynvvc,final_pnv) | **本轮:显存直通(zerocopy)** | 变化 |
+|---|---|---|---|
+| **e2e 全链路** | **16.30s** | **13.42s** | **1.21x** |
+| └ 探测段 | 0.10s | 0.10s | — |
+| **不含探测段** | 16.12s | **12.96s** | 1.24x |
+| decode 段 | 11.56s(与 read 重叠) | **8.60s**(拉帧+D2D+人脸帧落地;read 恒 0) | 见下 |
+| read 段 | 9.76s(重叠) | **0.00s**(无宿主全帧读取) | 消除 |
+| detect | 1.37s | **0.39s** | 3.5x(INTER_AREA 上 GPU+免 H2D) |
+| gaze | 1.78s | 1.54s | 1.16x(同宿主实现,帧来源变化带来的波动) |
+| **head** | **1.93s** | **1.06s** | 1.82x(letterbox 上 GPU+免 H2D) |
+| imwrite | 0.00s | 0.16s | 异步排空抖动,噪声级 |
+| 引擎加载 | 0.56s | 0.57s(device 臂 SCRFD/head 实例在首视频内懒建,含在 006 墙钟内) | — |
+
+- 逐视频 e2e:006 2.79→2.44s(1.14x)/ 099 4.60→3.58s(1.28x)/ 154 5.16→4.33s(1.19x)/ 214 3.74→3.07s(1.22x)。
+- 解码+读帧:宿主臂 decode/read 两段重叠后实际 ~11.6s(§9.2 GIL 串行)→ 本臂 **8.60s**(且 read=0):NVDEC 拉帧不变,省掉每帧 D2H+宿主 cvtColor;新增 D2D(0.15ms/帧)与人脸帧落地 D2H(508 帧)远小于省下部分。
+- 残余瓶颈:NVDEC 拉帧本身(~6-7s)+ 人脸帧落地 D2H;再往上要动 pose68/gaze/imwrite 的宿主消费语义(§9.6 建议的子进程解码对本臂无收益——宿主已无全帧读取)。
+
+### 10.5 本轮新增工程注意点
+
+1. **共享流保序**:解码器第 3/4 位置参数传 cudaContext/cudaStream(`CreateSimpleDecoder(video,0,ctx.handle,stream.handle,True,...,RGB)`),解码写帧与后续 kernel/D2D 在同一流上按程序序执行,无需显式同步(E3 T0 验证)。
+2. **池容量 chunk+8**:一次 `get_batch_frames(8)` 内的批边界溢出选中帧(≤8)不会覆盖本块未消费槽;块尾部放不下整块则整块回槽 0,保证块内**物理连续**(area/head kernel 按连续地址消费)且不跨池尾回绕;单线程消费下旧块先读完再写新块。
+3. **不引入翻转引擎**:device INTER_AREA 核直接输出 BGR(oswap=1)与宿主 cv2 结果逐字节一致,后续原核原引擎零改动;head 核 bswap=1 读已换序的池帧。任何 blob 逐字节差异都会表现为判定漂移,E1 的 0.00049 score 漂移路线已被否决。
+4. **pycuda 2026.1 精简版**:D2D 用 `drv.memcpy_dtod_async(dst_int, src_int, nbytes, stream)`;无 `drv.zeros/empty`,设备缓冲用 `GPUArray`,指针取 `__cuda_array_interface__["data"][0]`。
+5. **两条流水线的互斥**:`--pipeline` 线程重叠对本臂无意义(主循环自带块级批量,decode/detect 天然 GPU 串行保序),`_run_pass_gpu` 忽略该开关(breakdown 里 pipeline=off(dev));`--dedup` 需宿主全帧算清晰度,显式回退宿主臂。
+6. **device 版 SCRFD/head 实例与宿主实例并存**:同引擎文件各建一份 execution context,绑到自研流;回退到宿主臂时宿主实例原样可用。同一进程两份引擎+显存池 ~2.2GB,12GB 卡安全。
+7. 表外帧率(非 60/30fps)、元数据尺寸不符、解码中途断流等异常全部抛 `_PynvvcDecodeError`,复用 process() 现有逐级回退链(pynvvc→管道→落盘),语义与宿主 pynvvc 臂一致。
+
+## 11. 解码∥推理重叠(2026-09-29 第四轮,--overlap)
+
+### 11.0 结论摘要
+
+新增 `--overlap auto|on|off`(auto=on):重叠臂用 ThreadedDecoder 的 C++ 内部
+解码线程(NVDEC ASIC)与主线程推理在**同一条 pycuda 流**上块级重叠
+(producer-consumer:信号量 2 token + 有界队列 4,pop 时释放 token)。解码在
+NVDEC、推理在 SM,设备侧天然是两块硬件;探针证明共享一条流不互相限速。
+
+- **等价性:625/625 帧逐位一致**(9 项指标 |Δ|=0.0、JPG 名单一致、257 张 JPG
+  md5 逐字节一致:099 57/154 160/214 40/006 0)。
+- **e2e 13.42s → 10.30~10.44s(1.28~1.30x)**,逐视频 1.04~1.46x;
+  **不含探测段 9.92~9.94s**(首破 10s);`--overlap off` 臂 13.31/13.30s,
+  与 A 轮一致(开关语义正确,判定逐位同基线)。
+- 采纳的三项改动:①pinned slab 落地(async D2H,2 套轮换);②先建帧源再建
+  AreaTables(4K 表构建 ~0.3-0.5s 纯 CPU 与解码器预热重叠);③首块 16 削 ramp。
+- **2-stage 消费(判定链延后一块)两次实现均否决回退**:落地 D2H train +
+  producer D2D + 解码器写帧三者并发造成 CE 带宽拥塞,pose/gates 膨胀 30~60%,
+  超过隐藏收益(154 内部 2.874 → 4.196/3.819s)。
+- **子进程 CUDA IPC 路线无需启动**:E1/E1b 证明单流共享已不受限, ladder 第 2 级跳过。
+
+### 11.1 改动内容
+
+| 文件 | 内容 |
+|---|---|
+| `src/gpu_decode.py` | `_create_threaded_decoder` 工厂(独立函数便于测试注入失败;`CreateThreadedDecoder(video,16,0,ctx.handle,stream.handle,True,0,0,0,0,RGB)`,与 SimpleDecoder 同风格位置参数);`_OverlappedGpuSource`(producer 线程:内层 `_PynvvcGpuSource(decoder="threaded")` 按块 `read_block` → 有界队列;主线程构建内层源——CUDA context 归属正确,初始化失败同步抛出 → 串行臂回退;`first_chunk=16` 首块小批量削 ramp;块大小由 producer 决定,消费端 `read_block(n)` 忽略 n) |
+| `filter_video.py` | `--overlap` 参数(auto/on/off);`_run_pass_gpu`:`use_overlap` 分支(2 组槽池/pinned slab 落地/提前建源),回退 WARNING 文案;串行臂代码路径不变 |
+
+### 11.2 探针数据(全部 `_test/post4_*`,不猜)
+
+| 探针 | 结论 |
+|---|---|
+| E1 `post4_probe_streams.py`(154,4K):solo 2.28 / 同流压 16MB D2D 载荷 2.57 / 异流 2.57 ms/源帧 | 同流/异流 CE 负载都不限速解码 → 「写帧被同流推理拖慢」假设否定 |
+| E1b `post4_probe_kernelload.py`(099,4K 全尺寸 D2D):none 2.13 / 同流 SM kernel 2.17 / 异流 2.17 ms/源帧 | SM kernel 负载同样不限速 → 解码速率 = NVDEC 主导;**双流+event 修复无必要,子进程 IPC 路线无必要** |
+| 时间线 `post4_timeline.py`(154 逐块):可分页落地(sync `memcpy_dtoh` + 逐帧 `np.empty` 首触缺页)缺口 ~390-430ms/块 | 4K 帧 24.9MB 落地是隐藏大头;154 是 4 视频中唯一 consumer-bound(006/099/214 已在 NVDEC 地板 2.13-2.28ms/源帧) |
+| 2-stage 回归时间线(oovl_on5/6):154 内部 2.874 → 4.196(v1 显式延后释放)/ 3.819(v2 3 组槽+pop 释放);pose 94→153-221ms、gates 316→372-560ms、producer 解码 434→569ms | CE 拥塞证据链完整 → 判定链内联(ovl_on4)为最终形态 |
+
+### 11.3 等价性(625 帧,全部逐位一致)
+
+| 对比 | 结果 |
+|---|---|
+| 重叠臂 on(`run_ovl_on_final`)vs A 轮 zerocopy 基线 | **625/625 帧判定一致、9 项指标 |Δ|=0.0、JPG md5 逐字节一致(57+160+40+0)** |
+| `--overlap off`(`run_ovl_off`)vs 基线 | 同上逐位一致;13.44s ≈ A 轮 13.42(关闭即旧行为) |
+| 同会话 on/off 交替 ×2(`post4_ab.json`) | 4 轮判定全部逐位一致;on 10.36/10.30s、off 13.31/13.30s |
+| 回退冒烟(`post4_fallback_check.py`) | monkeypatch ThreadedDecoder 初始化失败 → WARNING「回退 A 轮串行臂」→ 串行臂跑 154,判定/JPG 逐位同基线;假 fps=24 标定外 → 链式回退(pynvvc→管道)正常完成 |
+| 中断/泄漏(`post4_abort_leak.py`) | 第 3 块注入 KeyboardInterrupt → 异常向上传播、`finally: src.close()+ex.shutdown` 不死锁、进程 3.3s 自行退出(exit 130);taskkill /F 强杀后 nvidia-smi 计算进程表无 python 残留、显存回落桌面基线(557MiB/12288MiB) |
+| 旧臂未受影响(`post4_oldarms_check.py`) | 宿主 pynvvc 臂 4 视频复跑 vs A 轮 `run_hostcheck` 基线:625/625 逐位一致 |
+
+### 11.4 耗时对比(r1 口径:单进程一臂 4 视频、引擎加载单列)
+
+| 口径 | §10 zerocopy(A 轮) | **本轮 overlap on** | 变化 |
+|---|---|---|---|
+| **e2e 全链路** | **13.42s** | **10.30~10.44s** | **1.28~1.30x** |
+| └ 探测段 | 0.10s | 0.10s | — |
+| **不含探测段** | 12.96s | **9.92~9.94s** | 1.30x |
+| decode 段 | 8.60s | 8.60s(未重叠工作量口径;其中 ~1.5-2.5s 与宿主判定链重叠) | 见下 |
+| detect | 0.39s | 0.52~0.56s | 重叠后波动 |
+| gaze | 1.54s | 1.70~1.74s | 同上 |
+| head | 1.06s | 1.08s | — |
+| imwrite | 0.16s | 0.12~0.16s | 噪声级 |
+
+- 逐视频 e2e:006 2.44→2.35s(1.04x)/ 099 3.58→2.72s(1.32x)/
+  154 4.33→2.96s(1.46x)/ 214 3.07→2.41s(1.27x)。
+- 增益来源:①解码与宿主判定链(pose/gaze/head/JPG)块级重叠(核心);
+  ②pinned 落地把落地缺口 390-430→~200ms/块;③先建源削 ramp ~0.3-0.5s/视频
+  + 首块 16 让消费端提前 ~0.4s 启动。
+- **距离解码地板**:006/099/214 的 wall ≈ 源帧数 × 2.13-2.28ms + 尾部,
+  已贴 NVDEC 地板;154 剩余 ~0.3s 为 pose/gaze/head 宿主链(60fps stride 3
+  人脸密度最高)。再往下只剩动宿主消费语义(3 条已否决:2-stage CE 拥塞、
+  双流+event 无收益、IPC 无必要)或 NV12 半宽写帧(等价风险大,未启动)。
+
+### 11.5 本轮新增工程注意点
+
+1. **槽安全(2 组轮换)**:信号量 2 token,pop 时释放上一个 token → producer
+   领先 ≤1 块;D2D(j) 覆写第 j%2 组上一用户是块 j-2,其 head 已在第 j-1 轮
+   迭代内同步完成,流上 D2D 必然排在其后,无覆写竞态(与池容量 2×(chunk+8)
+   自洽;串行臂同池容量连续游标两块驻留)。
+2. **pinned slab 复用必须等 JPG futures**:`_emit` 把宿主帧引用交给 imwrite
+   线程池,futures 视频结束才统一 wait —— 两套 slab 轮换,覆写第 j%2 套前
+   先 `wait(land_futs[set_i])`(块 k 的 JPG futures 在块尾登记)。
+3. **落地同步点**:`memcpy_dtoh_async` 入队后一次 `stream.synchronize()`,
+   替代逐帧同步 D2H —— 宿主判定链在此与 GPU 前后级会合,是逐块必需的数据
+   依赖;pinned 分配失败自动回退可分页逐帧路径(逐字节同)。
+4. **2-stage 否决教训**:「落地 D2H(CE)与判定(pose/gaze host 链)并行」
+   理论上成立,实测 CE 带宽拥塞(落地 train + producer D2D + 解码器写帧
+   三者并发)让双方都慢 30~60%;首块 16 无脸帧时判定窗口更小,ramp 反而
+   恶化。吞吐优化的并发度上限受 CE/SM/带宽三方约束,改结构前先测带宽。
+5. **producer 线程退出语义**:`close()` 置 stop 事件;有界 put 超时轮询
+   stop;内层源由主线程构建/异常同步抛 —— Ctrl-C 时 `finally` 关源不阻塞
+   (泄漏检查 3.3s 自行退出),daemon 线程随进程结束。
+6. **首块 16 与判定无关**:块大小只影响重叠窗口,不影响送入引擎的 blob
+   序列(逐块分批边界不变,FP16 引擎批组合不变性在此再次成立),等价性
+   全 PASS 证实。
+
+## 12. 判定链减负与到墙收尾(2026-09-29 第五轮,gaze 批量)
+
+### 12.0 结论摘要
+
+时间线剖析定案(§12.1):10.3s 墙钟里 producer 解码 8.0s(NVDEC 地板 ~7.0
++ 预热/交接),consumer 已大部分隐藏 —— 唯一值得动的是 gaze 段(1.61s,
+consumer 最大单项)。**gaze 批量化接入:固定 batch=1 引擎流水化 enqueue +
+线程池预处理,`estimate_batch` 块内一次调用;判定逐位一致**。动态 batch
+引擎(`--dyn`,min1/opt16/max32)按数据否决:0.09° 级批组合漂移必破坏
+「9 项指标 |Δ|=0.0」硬门槛(§12.2)。
+
+- **等价性:on/off 双臂 × 多轮全部 625/625 帧判定逐位一致、9 项指标
+  |Δ|=0.0、JPG md5 逐字节**(§12.7)。
+- **e2e 10.30~10.44 → 9.90~10.00s(1.03~1.05x);不含探测 9.92~9.94 →
+  9.53~9.58s**;gaze 段 1.70~1.74 → 0.87~0.89s(目标 ≤1.1 达成);
+  `--overlap off` 臂 13.44 → 12.57~12.63s(批量 gaze 在串行臂全额兑现)。
+- **流水深度 2→3 实测无收益**(非首视频变化 ≤0.04s=噪声,首视频多付
+  ~0.55s 一次性分配)→ 否决回退(§12.5)。
+- **剩余差距物理归因到墙**:producer 解码 8.6s ≈ NVDEC 纯解码 7.4~7.6
+  (3171 源帧 × 2.2~2.8ms,含 154 4K)+ 首视频预热 ~0.45 + 逐块 D2D/交接
+  ~0.6~0.8;consumer 4.3s 仅暴露 ~1.3s(各视频首块 ramp + 末块判定尾)。
+  再往下只剩动解码侧(NV12 半宽、源帧跳解)—— 已否决/超范围(§12.6)。
+
+### 12.1 时间线剖析(`_test/post5_timeline.py`,on 臂 4 视频逐块埋点)
+
+改造前(B 轮末,逐帧 gaze)/ 改造后(C 轮批量)合计(4 视频,s):
+
+| 段 | 改造前 | 改造后 | 说明 |
+|---|---|---|---|
+| **wall** | **10.21** | **9.90** | 单 VideoFilter 跨视频复用口径 |
+| pop 等待(会合) | 4.61 | 5.11 | consumer 等 producer,producer-bound 实证 |
+| producer 解码 | 8.00 | 8.63 | NVDEC 拉帧+D2D(后值含 154 与批量 gaze 的资源竞争) |
+| detect(SCRFD) | 0.51 | 0.48 | |
+| land(swap+D2H) | 0.90 | 0.91 | |
+| pose68 | 0.85 | 0.83 | |
+| judge(_judge+低头复核) | 0.01 | 0.00 | |
+| **gaze** | **1.61** | **0.87** | 批量化目标段(−0.74) |
+| head | 1.09 | 1.09 | B 轮已批量化 |
+| JPG futures 排空 | 0.13 | 0.13 | |
+| CSV/写盘 | ~0.01 | ~0.01 | 可忽略 → 任务「非 GPU 段并行化」仅剩 pose CPU 前处理(估 <0.2s),不做 |
+
+逐块视角:006 consumer 每块仅 0.03~0.09s(kept=0,几乎全 too_small 不落
+地),099/214 每块 pop 等待 0.5~0.7s —— 消费端在这些视频早已空转等解码;
+154 是唯一 consumer-bound 视频,gaze 批量收益在其全额兑现(§12.4)。
+
+### 12.2 gaze 批量等价探针(`_test/post5_gaze_probe.py`,数据
+`runs/post5_gaze_equiv.json`)
+
+308 个真实管线裁剪(4 视频 on 臂收集,≥52 要求的 6 倍)。基准 = 旧固定
+FP16 引擎逐帧 `_trt_pass`;attention 判定阈值 = 管线实际值
+(|pitch|>15° 或 |yaw|>20°):
+
+| 后端 | 逐位 | logits\|Δ\|max | \|Δyaw\|max | \|Δpitch\|max | attention 翻转 |
+|---|---|---|---|---|---|
+| B1 dyn 引擎 bs=1 | 否 | 2.734e-02 | 0.0946° | 0.0936° | 0 |
+| B2 dyn 引擎 分组 bs≤32 | 否 | =B1 | =B1 | =B1 | 0 |
+| **C1 固定引擎 流水 enqueue** | **是(全 0)** | 0 | 0 | 0 | **0** |
+| D FP32 引擎(噪声基线) | 否 | 4.608e-02 | 0.2016° | — | 0 |
+
+- dyn 引擎的漂移量级与 FP16-vs-FP32 噪声基线同阶(批组合 tiling 所致),
+  且 CSV gaze 列打印 3 位小数 → **0.09° 级漂移必破坏 |Δ|=0.0 硬门槛,
+  数据驱动否决**;产物 `models/gaze/resnet34_gaze_dyn_fp16.engine` 保留,
+  默认引擎不变(`resnet34_gaze_fp16.engine`)。
+- C1 同引擎同 blob 同流顺序执行,无批量算子 → 逐位一致 → **采纳接入**。
+- `estimate_batch` 数值等价(mismatch=0)与计时:逐帧 estimate 4.95
+  ms/帧 → 固定引擎批量 workers=0 4.71 / **workers=8 2.55 ms/帧**(1.9x)。
+
+### 12.3 改动内容
+
+| 文件 | 内容 |
+|---|---|
+| `src/gaze_resnet.py` | `estimate_batch(items, workers)`(线程池并行 `_prep` → 按引擎分组 → 逐帧 `_decode` 复用);固定引擎后端 `_infer_group_pipelined`(逐帧 H2D→execute→D2H 连续入队,`_PIPE_GROUP=32` 帧组末一次 sync;pinned slab `_pipe_slabs` 懒建,分配失败回退可分页,逐字节同);动态引擎后端 `_infer_group_dynamic`(否决未接入,代码保留);引擎 batch 维检测(动态/-1 vs 固定 1,非 1 且非动态报错) |
+| `filter_video.py` | `_gate_pre` 拆为 `_gate_judge`(阶段A)+`_gate_gaze`(阶段B 逐帧)+`_gaze_apply`(判定应用,单帧/批量共用)——host 臂/dedup 路径行为不变;`_run_pass_gpu` 两阶段循环改三阶段:**阶段A** 逐帧 judge(收集 keep 单脸候选)→ **阶段B** 块内一次 `gaze.estimate_batch` + 按帧序 `_gaze_apply`(dy_all 顺序=帧序)→ **阶段C** 按帧序 head 分发/emit(emit 调用时序变化,按键控无观测影响,§12.8-1) |
+| `scripts/build_gaze_engine.py` | `--dyn`:输入 batch 维 reshape 动态 + profile min=1/opt=16/max=32(图 GAP→Flatten→Gemm 天然 batch 安全) |
+| `src/gpu_decode.py` | 槽组数提为常量 `OVL_SETS`(实验后维持 2,§12.5) |
+| `_test/` | `post5_timeline.py`(逐块埋点)、`post5_gaze_probe.py`(等价探针) |
+
+### 12.4 耗时对比(r1 口径:单进程一臂 4 视频、引擎加载单列)
+
+| 口径 | §10 zerocopy(A 轮) | §11 overlap on(B 轮) | **本轮 C(gaze 批量)** | C vs B |
+|---|---|---|---|---|
+| **e2e 全链路** | 13.42s | 10.30~10.44s | **9.90~10.00s** | **1.03~1.05x** |
+| └ 探测段 | 0.10s | 0.10s | 0.09~0.10s | — |
+| **不含探测段** | 12.96s | 9.92~9.94s | **9.53~9.58s** | 1.04x |
+| gaze 段 | 1.54s | 1.70~1.74s | **0.87~0.89s** | 1.9~2.0x |
+| head 段 | 1.06s | 1.08s | 1.08~1.10s | — |
+| `--overlap off` 臂 e2e | — | 13.31~13.44s | **12.57~12.63s** | 1.06x(批量 gaze 串行臂全额兑现 −0.7) |
+
+- 累计加速比:**16.30 → 13.42(1.21x)→ 10.37(1.29x)→ 9.95(1.04x),
+  共 1.64x**。
+- on 臂逐视频(run_ovl_on_final → run_c_d2_on):006 2.35→2.28 /
+  099 2.72→2.72 / **154 2.97→2.64** / 214 2.42→2.30 —— 154(consumer-bound)
+  兑现最多;006/099/214 已在 NVDEC 地板,gaze 减负被地板吸收。
+- 同会话 on/off 交替 ×2(ab):on 10.00/9.90s、off 12.57/12.63s,波动
+  ≤0.1s,可复现。
+
+### 12.5 流水深度 2→3 实验(否决)
+
+槽组/信号量/pool/land slab 四处同步扩到 3(`OVL_SETS` 常量泛化,覆写安全
+论证不变:D2D(j) 同组上一用户是块 j−N ≤ j−2)。实测(run_c_d3_on):
+**合计 10.57s —— 006 2.82(多付 ~0.55s 一次性池/slab 分配),099/154/214
+变化 ≤0.04s=噪声**。producer 并未被 token 饿住(信号量 2 token 下 producer
+可领先 1 块 ≈ 0.5~0.9s,已覆盖块解码时长),回退 OVL_SETS=2。
+
+### 12.6 距 7.0s 地板的剩余构成(9.9s → 物理归因)
+
+| 构成 | 量级 | 依据 |
+|---|---|---|
+| NVDEC 纯解码 | ~7.4~7.6s | 3171 源帧 × 2.13~2.28ms(1080p)+ 154 4K ~2.8ms/源帧 |
+| 首视频 NVDEC 预热 | ~0.45s | 006 blk0 662ms/96 源帧(3x 地板),一次性 |
+| 逐块 D2D/队列交接 | ~0.6~0.8s | producer 逐块 prod_end 与源帧×地板之差 |
+| consumer 暴露(首块 ramp + 末块判定尾) | ~1.0~1.3s | 各视频解码器会话初始化 + 末块 gaze/head 在 producer EOF 后 |
+| CSV/排空 | ~0.15s | |
+
+- consumer 合计 4.3s 中 ~3.0s 已隐藏(pop 等待 5.10s 实证 producer-bound);
+  gaze 批量 −0.86s 只兑现 −0.4~−0.5s,其余被 NVDEC 地板吸收。
+- 154 producer 解码 1.62→2.17s(+0.55):疑与批量 gaze 流水 enqueue 的持续
+  H2D/D2H/SM 负载相关(E1b 仅在 1080p 证伪过 SM 限速,4K 未复测);即便
+  如此 154 墙钟仍 −0.33s。后续若再压 154,先复测 4K 下的负载-解码曲线。
+- 再往下只剩动解码侧:NV12 半宽写帧(等价风险大,§11 已列为未启动)、
+  源帧跳解(采样语义改变,超范围)—— 按任务书「不为凑数字引入风险」
+  到墙收尾。
+
+### 12.7 等价性与稳定性(全部 PASS)
+
+| 检查 | 结果 |
+|---|---|
+| on 臂 vs `run_ovl_on_final` 基线 | 625/625 帧判定一致、9 项指标 \|Δ\|=0.0、JPG md5 逐字节(57+160+40+0)—— c_gz154/c_gz_on/c_d2_on 三次复跑全过 |
+| `--overlap off` 臂 vs `run_ovl_off` 基线 | 同上逐位一致(c_gz_off + ab 两轮) |
+| 同会话 on/off 交替 ×2(`post4_ab.json` 覆写) | 4 轮 × 4 视频全部逐位一致 |
+| host pynvvc 臂 vs `run_hostcheck` 基线(`post4_oldarms_check.py`) | 625/625 逐位一致 —— 同时证明 `_run_pass`/`_gate_pre` 重构零行为变化(ffmpeg 管道臂共用该路径与帧源无关的判定链) |
+| 回退冒烟(`post4_fallback_check.py`) | ThreadedDecoder 初始化失败 → WARNING 回退串行臂;假 fps 标定外 → 链式回退正常(FALLBACK_PASS) |
+| Ctrl-C/强杀(`post4_abort_leak.py`) | 注入 KeyboardInterrupt exit 130 自行退出;强杀后无 python 计算进程残留、显存回落 512MiB 桌面基线(ABORT_LEAK_PASS) |
+| 006 的 maxdiff 缺 gaze/nheads 列 | 全帧 None 对 None 按口径跳过,非缺失 |
+
+### 12.8 本轮新增工程注意点
+
+1. **emit 顺序无关性**:批量 gaze 后 `_emit` 调用时序变化(阶段A 先处理
+   非候选帧,阶段C 再处理候选),但计数器、JPG 文件名、report 行序、
+   `land_futs` 登记全部按帧号/索引键控,输出字节不变 —— 由全量 md5 比对
+   证实。若未来加入顺序敏感输出(如流式写 CSV)需回到逐帧序。
+2. **dyn 引擎否决要留数据**:CSV gaze 列 3 位小数 → 任何 >1e-3° 漂移都
+   会破坏逐位一致;FP16 动态批组合漂移 0.09° 是同精度噪声基线量级,不是
+   bug。固定引擎流水化(单流顺序执行、无批量算子)才是零漂移路线。
+3. **探针 slab 视图陷阱**:pipelined 后端宿主缓冲按组复用,探针比较必须
+   sync 后立即 `.copy()`,否则下一组 D2H 覆写造成假性不一致(生产路径组内
+   立即 decode 无此问题)。
+4. **`_run_pass_gpu` 里 `g` 是 GPU 资源字典**:新增循环变量避开 `g`
+   (本轮踩过:批量 gaze 循环用 `g` 遮蔽 → `g["head"]` TypeError)。
+5. **OVL_SETS 泛化四处同步**:信号量 token、slot_base 取模、pool 容量、
+   land slab 套数(含 `g` 缓存列表的扩容兼容);实验否决后常量保留,后续
+   调深度只改一处。
+6. **批量 gaze 的 t_gaze 口径变化**:breakdown 中 gaze 现在按块内整次
+   `estimate_batch` 计(含线程池预处理),与逐帧口径直接可比(同段同工作)。

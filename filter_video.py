@@ -569,7 +569,7 @@ class VideoFilter:
                  dedup_sharp_side=256, dedup_backups=2, dedup_max_mem=48.0,
                  hw_decode=True, decode_mode="auto",
                  pipeline=True, pipeline_depth=16, head_batch=True,
-                 head_letterbox_workers=8):
+                 head_letterbox_workers=8, overlap="auto"):
         self.det = SCRFDTRTDetector(engine, max_batch=batch, conf_thres=conf)
         # 68 点 3D 姿态模型（可靠角度）；引擎缺失则回退 SCRFD 5 点 solvePnP
         self.pose68 = None
@@ -654,6 +654,15 @@ class VideoFilter:
         self.head_batch = head_batch
         # head letterbox 线程池大小（4K 帧 letterbox 4.0ms → 8 线程 2.05ms, 实测）
         self.head_letterbox_workers = head_letterbox_workers
+        # 解码∥推理重叠（仅 pynvvc-gpu 臂; --overlap auto/on/off）:
+        # auto=ThreadedDecoder 可用则开(初始化失败自动回退 A 轮串行臂),
+        # off=保留 A 轮串行行为。详见 src/gpu_decode._OverlappedGpuSource。
+        self.overlap = overlap
+        # --decode pynvvc-gpu 显存直通臂：懒建设备侧资源（首次使用时创建,
+        # 见 _ensure_gpu_arm）；其余帧源路径完全不触碰这些资源, 旧行为不变
+        self.engine_path = engine                  # SCRFD 原引擎文件（device 臂同引擎另建实例）
+        self._head_engine_path = head_model_path   # head 引擎路径（None → 默认解析）
+        self._gpu = None
 
     # 判定单帧：返回 (verdict, score, (yaw,pitch,roll), down_ratio, nfaces)
     #   no_face : 0 张脸
@@ -689,13 +698,12 @@ class VideoFilter:
             return "blink", score, pose, down, 1
         return "keep", score, pose, down, 1
 
-    def _gate_pre(self, frame, d, k, p68, dy_all):
-        """闸门链前半：_judge → 低头复核 → Stage2 眼神（不含 head）。
-        （从 _gate_chain 原样拆出，判定逻辑/顺序一行未改。）
+    def _gate_judge(self, frame, d, k, p68):
+        """闸门链前半·阶段A（不含 gaze）：_judge → 低头复核。
+        （C 轮从 _gate_pre 拆出，判定逻辑/顺序一行未改；_gate_pre 仍为
+        阶段A+阶段B 的组合，host 臂/dedup 路径行为不变。）
 
-        返回 (verdict, score, pose, down, nfaces, ear, gaze_mag, gaze_dy,
-              t_judge, t_gaze)。verdict=="keep" 且 nfaces==1 且 head 闸门开启
-        → 该帧还需过 Stage1.5 head（调用方决定逐帧或成批跑）。"""
+        返回 (verdict, score, pose, down, nfaces, ear, t_judge)。"""
         t1 = time.time()
         verdict, score, pose, down, nfaces = self._judge(
             d, k, p68[0] if p68 else None, p68[1] if p68 else None)
@@ -705,7 +713,36 @@ class VideoFilter:
         if (verdict == "keep" and self.down_min is not None
                 and down is not None and down < self.down_min):
             verdict = "down"
-        # Stage2 眼神闸门：Stage1 全过（头基本正）的单脸帧
+        return (verdict, score, pose, down, nfaces, ear, t_judge)
+
+    def _gaze_apply(self, g, verdict, dy_all):
+        """Stage2 眼神闸门的判定应用（单帧与批量共用；与 _gate_pre 原实现
+        逐行同逻辑）。g: resnet34 → (pitch_deg, yaw_deg) / iris →
+        (mag, dx, dy)，None=未测到（裁剪无效）。
+        返回 (verdict, gaze_mag, gaze_dy)。"""
+        gaze_mag = None
+        gaze_dy = None
+        if g is not None:
+            if self.gaze_model == "resnet34":
+                # g = (pitch_deg, yaw_deg)。CSV 沿用 gaze 两列：
+                # gaze_mag=|yaw|(度, 横向偏角)  gaze_dy=pitch(度, 正=仰)
+                gpitch, gyaw = g
+                gaze_mag, gaze_dy = abs(gyaw), gpitch
+                dy_all.append(gaze_dy)   # 2-pass 基线（resnet 模式单位=度）
+                if (abs(gpitch) > self.gaze_pitch_max
+                        or abs(gyaw) > self.gaze_yaw_max):
+                    verdict = "gaze"
+            else:
+                gaze_mag, _gdx, gaze_dy = g
+                dy_all.append(gaze_dy)
+                if gaze_mag > self.gaze_max:
+                    verdict = "gaze"
+        return verdict, gaze_mag, gaze_dy
+
+    def _gate_gaze(self, frame, d, verdict, nfaces, dy_all):
+        """闸门链前半·阶段B：Stage2 眼神（逐帧版，_gate_pre/_gate_chain 用）。
+        Stage1 全过（头基本正）的单脸帧才跑。
+        返回 (verdict, gaze_mag, gaze_dy, t_gaze)。"""
         gaze_mag = None
         gaze_dy = None
         t_gaze = 0.0
@@ -714,21 +751,21 @@ class VideoFilter:
             top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
             g = self.gaze.estimate(frame, d[top, :4])
             t_gaze = time.time() - t1
-            if g is not None:
-                if self.gaze_model == "resnet34":
-                    # g = (pitch_deg, yaw_deg)。CSV 沿用 gaze 两列：
-                    # gaze_mag=|yaw|(度, 横向偏角)  gaze_dy=pitch(度, 正=仰)
-                    gpitch, gyaw = g
-                    gaze_mag, gaze_dy = abs(gyaw), gpitch
-                    dy_all.append(gaze_dy)   # 2-pass 基线（resnet 模式单位=度）
-                    if (abs(gpitch) > self.gaze_pitch_max
-                            or abs(gyaw) > self.gaze_yaw_max):
-                        verdict = "gaze"
-                else:
-                    gaze_mag, _gdx, gaze_dy = g
-                    dy_all.append(gaze_dy)
-                    if gaze_mag > self.gaze_max:
-                        verdict = "gaze"
+            verdict, gaze_mag, gaze_dy = self._gaze_apply(g, verdict, dy_all)
+        return verdict, gaze_mag, gaze_dy, t_gaze
+
+    def _gate_pre(self, frame, d, k, p68, dy_all):
+        """闸门链前半：_judge → 低头复核 → Stage2 眼神（不含 head）。
+        （= _gate_judge + _gate_gaze 组合，判定逻辑/顺序与原单函数实现
+        完全一致；_run_pass_gpu 的批量版分两阶段调用同一套逻辑。）
+
+        返回 (verdict, score, pose, down, nfaces, ear, gaze_mag, gaze_dy,
+              t_judge, t_gaze)。verdict=="keep" 且 nfaces==1 且 head 闸门开启
+        → 该帧还需过 Stage1.5 head（调用方决定逐帧或成批跑）。"""
+        (verdict, score, pose, down, nfaces, ear,
+         t_judge) = self._gate_judge(frame, d, k, p68)
+        verdict, gaze_mag, gaze_dy, t_gaze = self._gate_gaze(
+            frame, d, verdict, nfaces, dy_all)
         return (verdict, score, pose, down, nfaces, ear, gaze_mag,
                 gaze_dy, t_judge, t_gaze)
 
@@ -792,19 +829,33 @@ class VideoFilter:
         dec_fps = self.max_fps if apply_fps else fps
 
         mode = self.decode_mode
+        if mode == "pynvvc-gpu" and self.dedup:
+            # dedup 需要宿主全帧（缩略图/清晰度计算），显存直通臂不落宿主全帧
+            # → 显式警告并回退宿主 pynvvc 臂（选帧规则/帧内容相同）
+            print("  WARNING: --decode pynvvc-gpu 不支持 --dedup"
+                  "（需宿主全帧算清晰度），本次回退 pynvvc 宿主帧源", flush=True)
+            mode = "pynvvc"
         # 解码帧源尝试顺序（失败逐级整体回退重跑，最终兜底 ffmpeg 落盘路径）：
         #   auto   : FFmpeg NVDEC 管道 → ffmpeg 落盘（默认，行为与旧版一致）
         #   pynvvc : PyNvVideoCodec 硬解 → FFmpeg NVDEC 管道 → ffmpeg 落盘
+        #   pynvvc-gpu : 显存直通零拷贝臂（device 帧不落宿主）→ 宿主 pynvvc → 管道 → 落盘
         #   gpu    : 仅 FFmpeg NVDEC 管道；ffmpeg: 仅落盘路径（旧行为）
         _SRC_LABEL = {"pynvvc": "pynvvc(NVDEC) 帧源", "pipe": "FFmpeg NVDEC 管道",
-                      "file": "ffmpeg 落盘"}
+                      "file": "ffmpeg 落盘",
+                      "pynvvc-gpu": "pynvvc-gpu(显存直通) 帧源"}
         chain = {"auto": ("pipe", "file"),
                  "pynvvc": ("pynvvc", "pipe", "file"),
+                 "pynvvc-gpu": ("pynvvc-gpu", "pynvvc", "pipe", "file"),
                  "gpu": ("pipe",),
                  "ffmpeg": ("file",)}[mode]
         last_err = None
         for i, kind in enumerate(chain):
             try:
+                if kind == "pynvvc-gpu":
+                    return self._run_pass_gpu(video_path, out_dir, yaw_lim,
+                                              shared_csv, w, h, size, fps,
+                                              apply_fps, dec_fps, nframes,
+                                              stem)
                 return self._run_pass(video_path, out_dir, yaw_lim, shared_csv,
                                       w, h, size, fps, apply_fps, dec_fps,
                                       nframes, stem,
@@ -1441,6 +1492,473 @@ class VideoFilter:
                         "dedup_dy_hits": dedup_dy_hits})
         return out
 
+    # ---------- --decode pynvvc-gpu: NVDEC 显存直通零拷贝臂（非 dedup 专用） ----------
+    def _ensure_gpu_arm(self):
+        """懒建 pynvvc-gpu 臂的设备侧资源（首次创建, 跨视频复用）：
+        自研 pycuda 流 + 自研 kernel cubin + 显存帧池 + 与宿主臂同引擎文件的
+        独立 SCRFD/head device 实例（绑定自研流, 与 NVDEC 解码器同流保序;
+        宿主臂实例 self.det / self.head 不受影响, 继续供回退路径使用）。"""
+        if self._gpu is None:
+            import pycuda.driver as _drv
+            from src.gpu_decode import GpuKernels, DeviceFramePool
+            from src.head_gate import HeadGate, _default_engine_path
+            stream = _drv.Stream()
+            g = {"stream": stream,
+                 "kernels": GpuKernels(),
+                 "pool": DeviceFramePool(),
+                 "det": SCRFDTRTDetector(self.engine_path, max_batch=self.batch,
+                                         conf_thres=self.conf)}
+            g["det"].stream = stream
+            if self.head is not None:
+                g["head"] = HeadGate(
+                    self._head_engine_path or _default_engine_path(),
+                    conf_thresh=self.head.conf_thresh)
+                g["head"].stream = stream
+            else:
+                g["head"] = None
+            self._gpu = g
+        return self._gpu
+
+    def _run_pass_gpu(self, video_path, out_dir, yaw_lim, shared_csv,
+                      w, h, size, fps, apply_fps, dec_fps, nframes, stem):
+        """--decode pynvvc-gpu: NVDEC device 帧显存直通零拷贝臂（仅非 dedup;
+        --dedup 时 process() 已显式警告并回退宿主 pynvvc 臂）。
+
+        判定流水与 _run_pass 非 dedup 分支逐行同逻辑（同计数器/同 CSV/同
+        Stage2 dy 闸门/同 breakdown 行），区别只在帧的来源与去向：
+          块     = read_block(detect_chunk): NVDEC device 帧按与 _PynvvcSource
+                   相同的 stride/delta 规则选中后 D2D 拷入显存池（不落宿主）
+          detect = 池槽 RGB --自研 INTER_AREA 核(输出 BGR, 与 cv2 逐字节一致)-->
+                   768 长边小图 --> 现役 preproc_kernel letterbox --> 原 SCRFD 引擎
+          人脸帧 = 池内 RGB→BGR 原地换通道 → 同步 D2H 落宿主（pose68/gaze/JPG 用;
+                   no_face / too_small 帧不落地 → 免全帧 D2H）
+          head   = 池槽(已 BGR) --自研 640 定点 letterbox 核--> fp32 blob -->
+                   原宿主 head 引擎（免宿主 letterbox 与 H2D）
+        送入各引擎的 blob 与宿主臂逐字节相同（配方验证 _test/post3_e2/e3），
+        判定结果结构性一致。初始化/解码失败抛 _PynvvcDecodeError →
+        process() 逐级回退 宿主 pynvvc → 管道 → 落盘 重跑。"""
+        import pycuda.driver as _drv
+        from pycuda.gpuarray import GPUArray
+        from src.gpu_decode import (AreaTables, OVL_SETS, _PynvvcGpuSource,
+                                    _OverlappedGpuSource, scrfd_block_detect,
+                                    head_slots_detect)
+        try:
+            g = self._ensure_gpu_arm()
+        except Exception as e:
+            raise _PynvvcDecodeError(f"pynvvc-gpu 臂初始化失败: {e!r}") from e
+        stream, kernels, pool = g["stream"], g["kernels"], g["pool"]
+
+        # SCRFD 768 长边几何（与 face_det._prepare_chunk 同式: 只缩不放）
+        if self.target_long and max(h, w) > self.target_long:
+            sf = self.target_long / max(h, w)
+            nw7, nh7 = int(round(w * sf)), int(round(h * sf))
+            rescale = 1.0 / sf
+        else:
+            nw7, nh7 = w, h
+            rescale = 1.0
+
+        try:
+            # 解码∥推理重叠(--overlap): ThreadedDecoder 内部 C++ 线程解码不占
+            # GIL, producer 线程拉帧+D2D, 主线程满速推理(探针1 P3b)。池容量
+            # OVL_SETS×(chunk+8): OVL_SETS 块一轮回, producer 领先
+            # ≤ OVL_SETS-1 块(信号量 OVL_SETS token)
+            use_overlap = self.overlap != "off"
+            # 显存帧池: 末批溢出帧 ≤8 不覆盖本块未消费槽; 重叠臂 producer
+            # 领先 ≤ OVL_SETS-1 块 → OVL_SETS 组槽轮换(token OVL_SETS 个:
+            # D2D(j) 覆写的第 j%OVL_SETS 组上一用户是块 j-OVL_SETS(≤j-2),
+            # 其判定链在 consumer pop(j-1) 前已同步完成); 串行臂连续游标
+            # 1 组驻留。分辨率变化时池自动重建。(C 轮实测 2→3 无收益, 维持 2)
+            pool.ensure((self.detect_chunk + 8)
+                        * (OVL_SETS if use_overlap else 1), h, w)
+            # B 轮: 先建帧源再建 AreaTables/768 暂存 —— 4K 表构建 ~0.3-0.5s
+            # 纯 CPU, 与解码器会话建立+首帧解码重叠(时间线探针: 首块 pop
+            # 等待 0.5-0.9s, 其中表构建占大头)。串行臂同样受益(解码器预热
+            # 提前), 判定不变(同一批对象, 只是创建顺序)。
+            src = None
+            if use_overlap:
+                try:
+                    src = _OverlappedGpuSource(video_path, w, h, fps,
+                                               self.max_fps, stream, pool,
+                                               self.detect_chunk)
+                except _PynvvcDecodeError as e:
+                    msg = str(e).splitlines()[0] if str(e) else "无输出"
+                    print(f"  WARNING: 重叠解码(ThreadedDecoder)初始化失败"
+                          f"（{msg}），回退 A 轮串行臂", flush=True)
+            if src is None:
+                # A 轮串行臂（--overlap off 或重叠初始化失败的回退, 逐位同基线）
+                src = _PynvvcGpuSource(video_path, w, h, fps, self.max_fps,
+                                       stream, pool)
+            tables = AreaTables(w, h, nw7, nh7)   # INTER_AREA 路径判定+表(整视频复用)
+            # 768 小图暂存（detect_chunk 个槽, 块间复用; 方法结束即释放）
+            small_ga = GPUArray((self.detect_chunk * nh7 * nw7 * 3,), np.uint8)
+        except _PynvvcDecodeError:
+            raise
+        except Exception as e:
+            raise _PynvvcDecodeError(f"pynvvc-gpu 臂初始化失败: {e!r}") from e
+
+        if self.verbose:
+            print(f"  decode {os.path.basename(video_path)}  {w}x{h}  src_fps={fps:.3f} "
+                  f"-> dec_fps={dec_fps:.3f}{' (downsampled)' if apply_fps else ''}  "
+                  f"~{nframes} frames  hwdec=nvdec(dev)  src=pynvvc-gpu  "
+                  f"768={w}x{h}->{nw7}x{nh7}({tables.kind})  pipeline=off(dev)"
+                  f"  overlap={'on' if isinstance(src, _OverlappedGpuSource) else 'off'}")
+
+        t0 = time.time()
+        frame_no = kept = drop_noface = drop_pose = drop_down = drop_multi = 0
+        drop_up = drop_blink = drop_downp = drop_gaze = drop_gazedown = 0
+        drop_head = 0
+        drop_toosmall = 0
+        # t_dec= NVDEC 拉帧+D2D(帧源内部累计) + 人脸帧落地(swap+D2H);
+        # t_read 恒 0(无宿主全帧读取) —— breakdown 行保持同一格式
+        t_dec = t_read = t_det = t_judge = t_gaze = t_write = 0.0
+        t_head = 0.0
+        ex = ThreadPoolExecutor(max_workers=self.jpg_workers)
+        futures = []
+        # B 轮: 落地 D2H 的常驻 pinned 缓冲(两套轮换)。可分页同步 memcpy_dtoh
+        # 的问题(时间线探针实测): (a) ~6.5ms/帧@4K(3.8GB/s), (b) 每帧
+        # np.empty 首触缺页, (c) 走 legacy 默认流与所有阻塞流互斥 —— 三者都
+        # 落在消费关键路径上。pinned slab 一次分配(g 内跨视频复用), 帧视图
+        # 零分配; async D2H 走 io 流不锁其它流。两套轮换 + 复用前等上一块
+        # JPG futures(imwrite 线程池持有帧引用, 视频结束才统一 wait —— 套
+        # 复用必须先确认引用已释放)。分配失败回退可分页逐帧路径(逐字节同)。
+        fb = h * w * 3
+        land_cap = (self.detect_chunk + 8) * fb
+        land_slabs = g.setdefault("_land_slabs", [None] * OVL_SETS)
+        while len(land_slabs) < OVL_SETS:      # 槽组 2→3 扩容(跨视频复用 g)
+            land_slabs.append(None)
+        land_sets = [None] * OVL_SETS
+        if use_overlap:
+            for _si in range(OVL_SETS):
+                if land_slabs[_si] is None or len(land_slabs[_si]) < land_cap:
+                    try:
+                        land_slabs[_si] = _drv.pagelocked_empty((land_cap,),
+                                                                np.uint8)
+                    except Exception:
+                        land_slabs[_si] = None
+                land_sets[_si] = land_slabs[_si]
+        land_turn = 0
+        land_futs = [None] * OVL_SETS
+        # 临时 pose 报告（与 _run_pass 同格式同生命周期）
+        report = []
+        dy_all = []    # 所有测到 gaze 的帧的 dy（2-pass 基线=其中位数）
+        dy_gate = []   # (帧号, 写出路径, dy)：keep 候选帧，循环后统一套用 dy 闸门
+        # dedup 统计（本臂不支持 dedup, 全为 0, 不参与汇总）
+        decoded_frames = 0
+        dedup_rows = []
+        seg_stats = {"segs": 0, "sent": 0, "reps": 0, "bk_judged": 0,
+                     "sec_judged": 0, "sec_hits": 0,
+                     "drop_seg": 0, "backup_hits": 0}
+        dedup_dy_hits = 0
+        try:
+            dec_mode = "pynvvc-gpu"
+            t_dec = 0.0
+
+            def _count_drop(vd):
+                nonlocal drop_noface, drop_pose, drop_down
+                nonlocal drop_multi, drop_up, drop_blink, drop_downp
+                nonlocal drop_gaze, drop_head
+                if vd == "no_face":
+                    drop_noface += 1
+                elif vd == "down":
+                    drop_down += 1
+                elif vd == "downp":
+                    drop_downp += 1
+                elif vd == "multi":
+                    drop_multi += 1
+                elif vd == "up":
+                    drop_up += 1
+                elif vd == "blink":
+                    drop_blink += 1
+                elif vd == "gaze":
+                    drop_gaze += 1
+                elif vd == "multi_head":
+                    drop_head += 1
+                else:
+                    drop_pose += 1
+
+            def _emit(frame, no, verdict, score, pose, down, nfaces,
+                      ear, gaze_mag, gaze_dy, nheads):
+                """一行 report + keep 落 JPG / drop 计数（与 _run_pass 逐行同）。"""
+                nonlocal kept
+                yaw, pitch, roll = pose
+                row = [no, verdict, score, yaw, pitch, roll, down,
+                       nfaces, ear, gaze_mag, gaze_dy, nheads]
+                if verdict == "keep":
+                    base = f"{stem}_{no:05d}"
+                    name = (f"{base}_{score:.2f}_{yaw:.0f}_{pitch:.0f}_{roll:.0f}.jpg"
+                            if self.score_name else f"{base}.jpg")
+                    futures.append(ex.submit(
+                        cv2.imwrite, os.path.join(out_dir, name), frame,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpg_q)]))
+                    kept += 1
+                    if self.gaze_dy_dev > 0 and gaze_dy is not None:
+                        dy_gate.append((no, os.path.join(out_dir, name), gaze_dy))
+                    if self.verbose:
+                        print(f"    #{no:05d} KEEP  score={score:.3f} "
+                              f"yaw={yaw:.0f} pit={pitch:.0f} rol={roll:.0f} "
+                              f"down={down:.2f}")
+                else:
+                    _count_drop(verdict)
+                    if self.verbose:
+                        print(f"    #{no:05d} drop  ({verdict}  down={down})")
+                return row
+
+            while True:
+                s0, m = src.read_block(self.detect_chunk)  # 等待已累计进 src.waited
+                if m == 0:
+                    break
+
+                # SCRFD: 池槽 RGB → 自研 INTER_AREA 核(出 BGR) → 现役 letterbox
+                # kernel → 原 SCRFD 引擎（16 一批, 与宿主臂 det.detect 分批一致）
+                t1 = time.time()
+                dets, kpss = scrfd_block_detect(
+                    kernels, g["det"], stream, pool, s0, m, h, w,
+                    small_ga, nh7, nw7, rescale, tables, self.conf)
+                t_det += time.time() - t1
+
+                # 人脸最小尺寸闸门（与 _run_pass 同逻辑）
+                ts_mask = set()
+                if self.min_face_h and self.min_face_h > 0:
+                    for i, d in enumerate(dets):
+                        if len(d) > 0:
+                            top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
+                            if (d[top, 3] - d[top, 1]) < self.min_face_h:
+                                ts_mask.add(i)
+
+                # 人脸帧落地: 池内 RGB→BGR 原地换通道 → async D2H(pinned
+                # slab, 不逐帧 np.empty 首触缺页) → 一次 stream.synchronize()。
+                # 仅人脸帧; no_face / too_small 帧不落地。
+                t1 = time.time()
+                face_idx = [i for i in range(m)
+                            if len(dets[i]) > 0 and i not in ts_mask]
+                for i in face_idx:
+                    kernels.swap_inplace(stream, pool.slot(s0 + i), h * w)
+                set_i = land_turn % OVL_SETS
+                if land_futs[set_i]:
+                    # 该套 pinned slab 上一块(块 k-OVL_SETS)的 JPG 已落盘才能
+                    # 覆写(_emit 把帧引用交给 imwrite 线程池, 视频结束才统一
+                    # wait)
+                    wait(land_futs[set_i])
+                    land_futs[set_i] = None
+                slab = land_sets[set_i]
+                _fmark = len(futures)   # 本块新提交的 JPG futures(登记 slab 复用)
+                chunk = {}
+                if slab is not None:
+                    # async D2H → pinned slab 帧视图, 入队后统一同步
+                    for j, i in enumerate(face_idx):
+                        fr = chunk[i] = slab[j * fb:(j + 1) * fb].reshape(
+                            h, w, 3)
+                        _drv.memcpy_dtoh_async(fr.reshape(-1),
+                                               pool.slot(s0 + i), stream)
+                    stream.synchronize()   # 落地 D2H 完成后再进宿主判定链
+                else:
+                    # pinned 分配失败 → 旧可分页同步路径(逐字节同)
+                    for i in face_idx:
+                        fr = np.empty((h, w, 3), np.uint8)
+                        _drv.memcpy_dtoh(fr.reshape(-1), pool.slot(s0 + i))
+                        chunk[i] = fr
+                land_turn += 1
+                t_dec += time.time() - t1   # 落地(swap+D2H 等待)计入 decode 段
+
+                # 68 点姿态：本块 >=1 脸帧主脸批量计算（不计时, 与 _run_pass 一致）
+                pose_map = {}
+                if self.pose68 is not None:
+                    items = []
+                    for i in face_idx:
+                        d = dets[i]
+                        top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
+                        items.append((i, chunk[i], d[top, :4]))
+                    if items:
+                        poses = self.pose68.estimate_batch(
+                            [(fr, bb) for _, fr, bb in items])
+                        pose_map = {i: p for (i, _, _), p in zip(items, poses)}
+
+                # ---- 两阶段闸门（与 _run_pass 逐行同逻辑）----
+                # C 轮 gaze 批量化（判定结构仍全部在块内完成，无跨块延后）:
+                #   阶段A 逐帧 _gate_judge（_judge+低头复核, 与原循环同输出, 不含
+                #         gaze）; keep 单脸候选收集进 gaze_jobs/pre_map
+                #   阶段B 块内候选一次批量眼神推理（gaze.estimate_batch: 固定
+                #         batch=1 引擎流水化 enqueue + 线程池预处理, 与逐帧
+                #         estimate 逐位一致, 等价表 _test/post5_gaze_probe.py;
+                #         dy_all 收集顺序=帧序, 与原实现一致）
+                #   阶段C 按帧序分发 head/_emit（与原实现同判定; 仅 emit 调用
+                #         时序变化 —— 计数/JPG 文件名/report 行序均按键控,
+                #         输出字节不变）
+                head_jobs = []    # (块内序号 i, frame)
+                head_meta = {}    # i → (frame_no, score, pose, down, nfaces, ear, gaze_mag, gaze_dy)
+                rows = [None] * m
+                gaze_jobs = []    # (块内序号 i, frame, bbox)
+                pre_map = {}      # i → (verdict, score, pose, down, nfaces, ear, frame_no)
+                for i in range(m):
+                    frame_no += 1
+                    d = dets[i]
+                    # too_small 直接判：跳过 pose/gaze/head 推理，不落 JPG
+                    if (self.min_face_h and self.min_face_h > 0
+                            and i in ts_mask):
+                        top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
+                        score = float(d[top, 4])
+                        if self.score_name:
+                            rows[i] = [frame_no, "too_small", score,
+                                       0.0, 0.0, 0.0, None, len(d),
+                                       None, None, None, None]
+                        drop_toosmall += 1
+                        if self.verbose:
+                            print(f"    #{frame_no:05d} drop  (too_small  "
+                                  f"fh={d[top, 3]-d[top, 1]:.0f})")
+                        continue
+                    frame = chunk.get(i)   # 仅人脸帧非 None（其余闸门不触碰 frame）
+                    k = kpss[i]
+                    _p = pose_map.get(i)
+                    (verdict, score, pose, down, nfaces, ear,
+                     _tj) = self._gate_judge(frame, d, k, _p)
+                    t_judge += _tj
+                    if verdict == "keep" and nfaces == 1:
+                        top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
+                        if self.gaze is not None:
+                            gaze_jobs.append((i, frame, d[top, :4]))
+                        pre_map[i] = (verdict, score, pose, down, nfaces,
+                                      ear, frame_no)
+                        continue
+                    # 不进 Stage2/Stage3 的帧在此判定终结（与原实现同输出）
+                    rows[i] = _emit(frame, frame_no, verdict, score, pose,
+                                    down, nfaces, ear, None, None, None)
+                # 阶段B: 批量 gaze（无 keep 候选则零开销; workers=线程池预处理,
+                # cv2 释放 GIL, blob 与逐帧一致）
+                if gaze_jobs:
+                    t1 = time.time()
+                    gouts = self.gaze.estimate_batch(
+                        [(fr, bb) for _, fr, bb in gaze_jobs])
+                    t_gaze += time.time() - t1
+                    for (i, frame, _bb), gz in zip(gaze_jobs, gouts):
+                        (verdict, score, pose, down, nfaces, ear,
+                         no) = pre_map.pop(i)
+                        verdict, gaze_mag, gaze_dy = self._gaze_apply(
+                            gz, verdict, dy_all)
+                        if (verdict == "keep" and nfaces == 1
+                                and self.head is not None):
+                            head_jobs.append((i, frame))
+                            head_meta[i] = (no, score, pose, down, nfaces,
+                                            ear, gaze_mag, gaze_dy)
+                            continue
+                        rows[i] = _emit(frame, no, verdict, score, pose,
+                                        down, nfaces, ear, gaze_mag,
+                                        gaze_dy, None)
+                # 阶段C: 剩余 keep 候选（gaze 关闭, 或 gaze 后仍 keep 且 head
+                # 关闭）按帧序分发 —— 与原实现 verdict 流完全一致
+                for i, (verdict, score, pose, down, nfaces, ear,
+                        no) in list(pre_map.items()):
+                    frame = chunk.get(i)
+                    if (verdict == "keep" and nfaces == 1
+                            and self.head is not None):
+                        head_jobs.append((i, frame))
+                        head_meta[i] = (no, score, pose, down, nfaces, ear,
+                                        None, None)
+                        continue
+                    rows[i] = _emit(frame, no, verdict, score, pose, down,
+                                    nfaces, ear, None, None, None)
+                if head_jobs:
+                    t1 = time.time()
+                    # device 直通: 池槽(已 BGR) → 自研 640 定点 letterbox 核 →
+                    # 原宿主 head 引擎（按 head.max_batch 分批, 与 detect_batch 一致）
+                    _hbs = head_slots_detect(
+                        kernels, g["head"], stream, pool,
+                        [s0 + i for i, _fr in head_jobs], h, w)
+                    t_head += time.time() - t1
+                    for (i, frame), _hb in zip(head_jobs, _hbs):
+                        (no, score, pose, down, nfaces, ear,
+                         gaze_mag, gaze_dy) = head_meta[i]
+                        nheads = len(_hb)
+                        verdict = "multi_head" if nheads >= 2 else "keep"
+                        rows[i] = _emit(frame, no, verdict, score, pose,
+                                        down, nfaces, ear, gaze_mag,
+                                        gaze_dy, nheads)
+                if self.score_name:
+                    report.extend(r for r in rows if r is not None)
+                if slab is not None:
+                    # 本块 JPG futures 视频结束才统一 wait, 登记到 land_futs:
+                    # 2 块之后覆写该套 slab 前先 wait(见上)
+                    land_futs[set_i] = futures[_fmark:]
+
+            # NVDEC 拉帧+D2D 等待（read_block 内部累计）计入 decode 段
+            t_dec += src.waited
+
+            # 排空 JPEG 线程池
+            t1 = time.time()
+            wait(futures)
+            t_write = time.time() - t1
+
+            # Stage2 纵向眼神闸门（2-pass 后半，与 _run_pass 逐行同逻辑）
+            if self.gaze_dy_dev > 0 and len(dy_all) >= 3:
+                med = float(np.median(dy_all))
+                hit = {}
+                for no, path, dy in dy_gate:
+                    if abs(dy - med) > self.gaze_dy_dev:
+                        hit[no] = dy
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+                if hit:
+                    kept -= len(hit)
+                    drop_gazedown += len(hit)
+                    if self.dedup:
+                        dedup_dy_hits += len(hit)
+                    for r in report:
+                        if r[0] in hit:
+                            r[1] = "gazedown"
+                    if self.verbose:
+                        for no, dy in sorted(hit.items()):
+                            print(f"    #{no:05d} drop (gazedown dy={dy:.3f} "
+                                  f"med={med:.3f})")
+
+            if report:
+                csv_name = (f"pose_report_{stem}.csv" if shared_csv
+                            else "pose_report.csv")
+                csv_path = os.path.join(out_dir, csv_name)
+                with open(csv_path, "w", encoding="utf-8") as cf:
+                    cf.write("frame,verdict,score,yaw,pitch,roll,down_ratio,nfaces,ear,gaze_mag,gaze_dy,nheads\n")
+                    for (no, vd, sc, y, p, r, dn, nf, er, gm, gd, nh) in report:
+                        dtag = f"{dn:.3f}" if dn is not None else ""
+                        etag = f"{er:.3f}" if er is not None else ""
+                        gtag = f"{gm:.3f}" if gm is not None else ""
+                        gdt = f"{gd:.3f}" if gd is not None else ""
+                        nht = f"{nh}" if nh is not None else ""
+                        cf.write(f"{no},{vd},{sc:.3f},{y:.1f},{p:.1f},{r:.1f},{dtag},{nf},{etag},{gtag},{gdt},{nht}\n")
+            if dedup_rows:   # 本臂恒空, 保留同款守卫以防复用
+                with open(os.path.join(out_dir, "dedup_report.csv"), "w",
+                          encoding="utf-8") as dfh:
+                    dfh.write("frame,diff,seg_id,seg_start,seg_end,sharp,is_rep\n")
+                    for (fi, dif, sid, s0, s1, sh, isrep) in dedup_rows:
+                        dfh.write(f"{fi},{dif:.3f},{sid},{s0},{s1},{sh:.1f},{isrep}\n")
+        finally:
+            src.close()
+            ex.shutdown(wait=True)
+
+        dt = time.time() - t0
+        dm = f"{self.down_min:g}" if self.down_min is not None else "?"
+        head_label = f"{frame_no} frames"
+        rate = frame_no / dt
+        print(f"  {os.path.basename(video_path)}: {head_label} -> "
+              f"kept {kept}  (drop {drop_noface} no-face, {drop_pose} pose, "
+              f"{drop_up} up, {drop_downp} downp, {drop_gaze} gaze, "
+              f"{drop_gazedown} gazedown, {drop_blink} blink, "
+              f"{drop_down} down<{dm}, {drop_multi} multi, "
+              f"{drop_head} multi-head, {drop_toosmall} too-small)  "
+              f"in {dt:.1f}s ({rate:.0f} fps)  -> {os.path.abspath(out_dir)}")
+        print(f"    [breakdown] decode={t_dec:5.2f}s  read={t_read:5.2f}s  "
+              f"detect={t_det:5.2f}s  judge={t_judge:5.2f}s  gaze={t_gaze:5.2f}s  "
+              f"head={t_head:5.2f}s  imwrite={t_write:5.2f}s ({kept} frames)")
+        out = {"frames": frame_no, "kept": kept, "no_face": drop_noface,
+               "decode_mode": dec_mode,
+               "pose": drop_pose, "down": drop_down, "multi": drop_multi,
+               "up": drop_up, "downp": drop_downp, "gaze": drop_gaze,
+               "gazedown": drop_gazedown, "blink": drop_blink,
+               "head": drop_head, "toosmall": drop_toosmall,
+               "pipeline": False, "pipe_depth": self.pipeline_depth,
+               "overlap": isinstance(src, _OverlappedGpuSource),
+               "seconds": dt}
+        return out
+
     def run(self, targets, yaw_lim, shared_csv=False):
         """targets: list of (video_path, out_dir). shared_csv: 多视频共享同一
         out_dir 时，CSV 按视频名区分（pose_report_<stem>.csv）防互相覆盖。"""
@@ -1661,15 +2179,21 @@ def main():
                     help="NVDEC GPU 硬解（默认开：ffmpeg 在 -i 前加 -hwaccel cuda；"
                          "--no-hw-decode 回 CPU 软解，即旧行为）。硬解失败"
                          "（非 0 退出/异常）自动 WARNING 并回退软解重跑")
-    ap.add_argument("--decode", choices=["auto", "gpu", "ffmpeg", "pynvvc"], default="auto",
+    ap.add_argument("--decode", choices=["auto", "gpu", "ffmpeg", "pynvvc",
+                                         "pynvvc-gpu"], default="auto",
                     help="解码帧源（默认 auto）: gpu=ffmpeg NVDEC+GPU 转换直出 bgr24 "
                          "rawvideo 到 stdout 管道、Python 内存流式读（与 ffmpeg 路径同一"
                          "命令 bit-exact，不落 3GB raw，解码与下游检测重叠）；"
                          "auto=gpu，失败（含中途断流）自动 WARNING 回退 ffmpeg 落盘路径"
                          "重跑；pynvvc=PyNvVideoCodec(NVDEC) 硬解帧源（按源帧号 "
                          "stride*k+delta 抽帧，仅 60/30fps 已标定、表外帧率自动回退管道；"
-                         "失败同样逐级回退 管道→落盘）；ffmpeg=现有 3GB raw 落盘路径"
-                         "（旧行为，一行未改）。--hw-decode 对 auto/gpu/ffmpeg 路径均生效")
+                         "失败同样逐级回退 管道→落盘）；pynvvc-gpu=显存直通零拷贝臂"
+                         "（NVDEC device 帧不落宿主: 自研 INTER_AREA/letterbox 核在显存"
+                         "完成预处理 → 原引擎零拷贝推理, blob 与宿主臂逐字节相同, 判定"
+                         "结构性一致; 仅人脸帧 D2H 落地, 不支持 --dedup 会显式警告并回退 "
+                         "pynvvc; 表外帧率/失败逐级回退 pynvvc→管道→落盘）；"
+                         "ffmpeg=现有 3GB raw 落盘路径（旧行为，一行未改）。"
+                         "--hw-decode 对 auto/gpu/ffmpeg 路径均生效")
     ap.add_argument("--pipeline", action=argparse.BooleanOptionalAction, default=True,
                     help="解码/推理流水线重叠（默认开, --no-pipeline 关, 便于 A/B）: "
                          "后台线程从帧源取帧入有界队列, 主线程攒批推理。"
@@ -1684,6 +2208,12 @@ def main():
                     help="head 闸门按块批量化（默认开, --no-head-batch 关）: 把一块内"
                          "所有送入 head 的帧合成一次 detect_batch（原来逐帧 batch=1、"
                          "每帧一次 execute+sync）。判定语义不变（逐位等价已验证）")
+    ap.add_argument("--overlap", choices=["auto", "on", "off"], default="auto",
+                    help="解码∥推理重叠（仅 --decode pynvvc-gpu 臂）: auto=默认,"
+                         "ThreadedDecoder 内部 C++ 线程解码不占 GIL, 后台 producer "
+                         "拉帧+D2D, 主线程满速推理（初始化失败自动 WARNING 回退 A 轮"
+                         "串行臂）; off=A 轮串行行为（A/B 用）; on=强制开（失败同样"
+                         "回退串行）。判定逐位不变（同一共享流保序, 帧即拉即拷）")
     ap.add_argument("--dedup", action="store_true",
                     help="抽帧去重+段内选最佳帧(默认关): 连续相似帧分段, 段内选最清晰一张"
                          "(避运动模糊)送检; 快速动作/scene cut 逐帧独立成段→不漏帧; "
@@ -1806,7 +2336,8 @@ def main():
                      decode_mode=args.decode,
                      pipeline=args.pipeline,
                      pipeline_depth=args.pipeline_depth,
-                     head_batch=args.head_batch)
+                     head_batch=args.head_batch,
+                     overlap=args.overlap)
     vf.run(targets, args.yaw, shared_csv=shared_csv)
 
 
