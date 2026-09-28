@@ -4,6 +4,11 @@
 filter_video.py — 从视频里挑出「人脸质量好」的原始帧，导出为 JPG（不重新编码视频）
 
 流程（方案1）:
+  0. 解码帧源（--decode，默认 auto）: auto/gpu = ffmpeg NVDEC+GPU 转换直出
+     bgr24 raw 到 stdout 管道、Python 内存流式读（与 ffmpeg 路径同一命令
+     bit-exact，不落 3GB raw）；失败自动回退 ffmpeg；pynvvc = PyNvVideoCodec
+     NVDEC 硬解帧源（自抽帧 + RGB→BGR，失败逐级回退 管道→落盘）；
+     ffmpeg = 旧落盘路径。
   1. ffmpeg 按【原始分辨率】解码；若源帧率 > --max-fps（默认 10），则用 `fps`
      滤镜【均匀】降到 10fps（30fps→10fps，丢掉重复画面，省时）。
   2. 每帧并行缩放到 --target-long 长边（只影响检测，不 upscale），送 SCRFD
@@ -48,6 +53,7 @@ import sys
 import json
 import time
 import queue
+import ctypes
 import shutil
 import tempfile
 import subprocess
@@ -60,6 +66,7 @@ import cv2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.face_det import SCRFDTRTDetector, estimate_pose
 from src.face_pose68 import FacePose68
+from src.frame_dedup import FrameDedupSelector
 
 
 # ---------------- helpers ----------------
@@ -77,8 +84,59 @@ def _parse_rate(s):
         return 0.0
 
 
+def _nframes_from_meta(st, fmt_dur, fps):
+    """容器元数据估帧数：nb_frames 优先，缺失时 duration×fps。都拿不到返回 0。
+
+    允许 ±1 误差：nframes 只用于 verbose 进度显示（见 probe 文档字符串），
+    解码循环由 EOF 驱动，绝不依赖这个数，所以不存在漏帧/死循环风险。
+    """
+    try:
+        nb = int(st.get("nb_frames") or 0)
+    except (TypeError, ValueError):
+        nb = 0
+    if nb > 0:
+        return nb
+    # stream 级 duration 优先（更贴近该流），其次容器级 format.duration
+    try:
+        dur = float(st.get("duration") or 0) or float(fmt_dur or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    if fps > 0 and dur > 0:
+        return max(1, int(round(dur * fps)))
+    return 0
+
+
 def probe(path):
-    """Return (width, height, fps, nframes) of the first video stream."""
+    """Return (width, height, fps, nframes) of the first video stream.
+
+    nframes 走【毫秒级】容器元数据（nb_frames，缺失时 duration×fps，允许 ±1），
+    不再默认 ffprobe -count_frames——那是对整条视频逐帧软解数数，4K 视频一个
+    13~23s，占 e2e ~75%（见 data/e2e_benchmark_2026-09-28.md）。nframes 仅用于
+    verbose 进度显示与日志（w/h/fps 才参与解码命令与循环 shape），元数据缺失/
+    解析异常时才回退 -count_frames 精确数一遍（慢但准）。
+    """
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+           "-show_entries",
+           "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,duration",
+           "-show_entries", "format=duration",
+           "-of", "json", path]
+    st = None
+    fmt_dur = 0.0
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True,
+                             timeout=60).stdout
+        j = json.loads(out)
+        st = j["streams"][0]
+        fmt_dur = float((j.get("format") or {}).get("duration") or 0.0)
+    except Exception:
+        st = None                      # 元数据路径失败 → 走下方精确兜底
+    if st is not None:
+        w, h = int(st["width"]), int(st["height"])
+        fps = _parse_rate(st.get("avg_frame_rate") or st.get("r_frame_rate"))
+        nframes = _nframes_from_meta(st, fmt_dur, fps)
+        if nframes > 0:
+            return w, h, fps, nframes
+    # 兜底：旧方法（-count_frames 全软解逐帧计数，慢但精确）
     cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
            "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate,nb_read_frames",
            "-of", "json", path]
@@ -113,15 +171,276 @@ def pitch_down_proxy(kps):
     return d_nm / d_en
 
 
+# ---------------- 解码帧源 ----------------
+class _PipeDecodeError(RuntimeError):
+    """管道解码失败（ffmpeg 非 0 退出 / 中途断流），auto 模式据此回退落盘路径。"""
+
+
+class _PipeRaw:
+    """ffmpeg NVDEC(+GPU 转换) 直出 bgr24 raw 到 stdout 管道的帧源（替代 3GB 落盘）。
+
+    与落盘路径【同一条 ffmpeg 命令】(仅输出改 pipe:1)，逐帧字节 bit-exact
+    （已用 md5 对照验证）。stderr 由后台线程排空（防管道死锁，正是当年放弃
+    pipe 的原因），并保留尾部错误信息用于回退诊断。
+
+    读语义与文件一致：read(size) 返回恰好 size 字节；干净 EOF 返回 b""；
+    ffmpeg 非 0 退出/中途断流抛 _PipeDecodeError。
+    waited 累计等待 ffmpeg 产帧的秒数（= 解码+转换+D2H+管道传输），
+    供 breakdown 把该段计入 decode。
+
+    ⚠️ 内部必须以【小分块(32KB)】os.read：Windows 管道对大请求(如 16MB)的
+    ReadFile 会阻塞到攒满/EOF，实测把吞吐从 ~1.2GB/s 压到 6~50MB/s
+    （30fps 源尤其严重）。32KB 分块读全 4K 视频 ~1.2GB/s。
+    """
+
+    def __init__(self, cmd):
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE)
+        self._fd = self._proc.stdout.fileno()
+        self._chunks = []
+        self._avail = 0
+        self._closed = False
+        self.waited = 0.0
+        self._err_tail = []
+        self._th = threading.Thread(target=self._drain_err, daemon=True)
+        self._th.start()
+
+    def _drain_err(self):
+        try:
+            while True:
+                line = self._proc.stderr.readline()
+                if not line:
+                    break
+                self._err_tail.append(line.decode("utf-8", "replace").rstrip())
+                if len(self._err_tail) > 30:
+                    del self._err_tail[0]
+        except (OSError, ValueError):
+            pass
+
+    def read(self, size):
+        t1 = time.time()
+        while self._avail < size:
+            chunk = os.read(self._fd, 1 << 15)   # 32KB 分块(见类注释)
+            if not chunk:
+                break
+            self._chunks.append(chunk)
+            self._avail += len(chunk)
+        self.waited += time.time() - t1
+        if self._avail >= size:
+            out = []
+            need = size
+            while need:
+                c = self._chunks[0]
+                if len(c) <= need:
+                    out.append(c)
+                    need -= len(c)
+                    self._avail -= len(c)
+                    self._chunks.pop(0)
+                else:
+                    out.append(c[:need])
+                    self._chunks[0] = c[need:]
+                    self._avail -= need
+                    need = 0
+            return b"".join(out)
+        # 不足一帧：干净 EOF 还是错误？
+        rc = self._proc.wait()
+        self._th.join(timeout=1.0)
+        if rc == 0 and self._avail == 0:
+            return b""
+        raise _PipeDecodeError(
+            f"ffmpeg 管道解码中断 rc={rc} 残留{self._avail}B: "
+            + " | ".join(self._err_tail[-5:]))
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._proc.stdout.close()
+        except (OSError, AttributeError):
+            pass
+        try:
+            self._proc.wait(timeout=5)
+        except Exception:
+            try:
+                self._proc.kill()
+            except OSError:
+                pass
+        self._th.join(timeout=1.0)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+# ---------------- pynvvc (PyNvVideoCodec / NVDEC) 帧源 ----------------
+# 选帧标定表：GT 是 ffmpeg `-vf fps=10` 抽帧，对应【源帧号 = stride*k + delta】。
+# 由内容匹配谷底法标定（4 个 4K 竖屏 HEVC 视频全部一致），见
+# data/e2e_benchmark_2026-09-28.md §1/§8.5。表外帧率（VFR / 24 / 25 / 59.94…）
+# 【绝不猜】→ _pynvvc_stride_delta 返回 None，回退 FFmpeg 管道路径。
+_PYNVVC_ALIGN = {60.0: (6, 2), 30.0: (3, 1)}
+
+
+class _PynvvcDecodeError(RuntimeError):
+    """pynvvc 帧源失败（import / 建解码器 / 尺寸不符 / 解码中断 / 帧数短缺）。
+    --decode pynvvc 模式据此整体回退 FFmpeg 管道路径重跑（该视频从头重跑，
+    与 auto 模式管道失败回退落盘的既有语义一致）。"""
+
+
+def _pynvvc_stride_delta(src_fps, max_fps):
+    """按帧率返回 (stride, delta)；无法确定时返回 None。
+
+    源 fps <= max_fps 时 ffmpeg 不加 fps 滤镜、逐帧全取，pynvvc 同样全取
+    → stride=1/delta=0 是精确对应，不算猜。
+    """
+    if not (max_fps and max_fps > 0 and src_fps > max_fps):
+        return 1, 0
+    for fps_k, (s, d) in _PYNVVC_ALIGN.items():
+        if abs(src_fps - fps_k) < 0.05:
+            return s, d
+    return None
+
+
+class _PynvvcSource:
+    """PyNvVideoCodec(NVDEC 硬解) 帧源，接口对齐 _PipeRaw：
+      read(size) -> 恰好 size 字节的 1-D uint8 ndarray（bgr24，下一选中帧）；
+                    干净 EOF -> b""；解码异常 -> _PynvvcDecodeError
+      waited     -> read() 内累计耗时（解码+拉帧+RGB→BGR），_run_pass 计入 decode 段
+      close()    -> 释放 NVDEC 会话（pynvvc 不支持重放/seek，每个视频新建、用完即弃）
+
+    与 _PipeRaw 的关键差异：
+    - 选帧按【源帧号 = stride*k + delta】自己抽帧（仅 60/30fps 已标定，表外回退）
+    - pynvvc 宿主内存输出【真 RGB】（2.2.3 无 BGR24），必须转 BGR 才能进管线：
+      pose68 / gaze / head / imwrite 全按 BGR 语义，letterbox kernel 也是 BGR 输入
+    - EOF 按 get_stream_metadata().num_frames 兜底核对（pynvvc 到 EOF 会刷
+      INVALID INDEX WARN，无害）；实际以解出的帧为准，元数据只用来发现中途断流
+    - read() 返回 ndarray 而非 bytes：np.frombuffer 对它是零拷贝视图，
+      省掉 tobytes 那次全帧拷贝（4K 帧 ~4ms，625 帧 ~2.6s）——调用方
+      `np.frombuffer(buf, np.uint8).reshape(h, w, 3)` 与 len(buf) 语义不变
+    """
+
+    def __init__(self, video, w, h, fps, max_fps):
+        self.waited = 0.0
+        self._closed = False
+        self.w, self.h, self.fps = int(w), int(h), float(fps)
+        sd = _pynvvc_stride_delta(self.fps, max_fps)
+        if sd is None:
+            raise _PynvvcDecodeError(
+                f"src_fps={self.fps:g} 不在已标定集合 {sorted(_PYNVVC_ALIGN)}")
+        self.stride, self.delta = sd
+        self._next_want = self.delta
+        self._given = 0
+        try:
+            import PyNvVideoCodec as pnv
+            self.dec = pnv.CreateSimpleDecoder(
+                video, outputColorType=pnv.OutputColorType.RGB)
+            md = self.dec.get_stream_metadata()
+            self.num_frames = int(getattr(md, "num_frames", 0) or 0)
+            mw = int(getattr(md, "width", 0) or 0)
+            mh = int(getattr(md, "height", 0) or 0)
+        except Exception as e:
+            self.dec = None
+            raise _PynvvcDecodeError(f"pynvvc 建解码器失败: {e!r}") from e
+        # 尺寸/旋转守卫：pynvvc 与 ffprobe 尺寸不一致（如旋转 metadata 处理不同）
+        # 时像素内容必错 → 回退 FFmpeg 管道（ffmpeg 会 autorotate）
+        if (mw, mh) != (self.w, self.h):
+            self.dec = None
+            raise _PynvvcDecodeError(
+                f"pynvvc 解码尺寸 {mw}x{mh} != ffprobe {self.w}x{self.h}"
+                f"（旋转/元数据差异）")
+        self._it = self._iter_frames()
+
+    def _read_frame(self, f):
+        """pynvvc DecodedFrame（宿主内存, useDeviceMemory=0 默认）→ (h,w,3) RGB 视图"""
+        ptr = int(f.cuda()[0].dataptr)
+        buf = (ctypes.c_ubyte * (self.h * self.w * 3)).from_address(ptr)
+        return np.ctypeslib.as_array(buf).reshape(self.h, self.w, 3)
+
+    def _iter_frames(self):
+        """顺序解全部源帧，只产出选中帧（源帧号 = stride*k + delta）。"""
+        got = 0
+        while True:
+            try:
+                frames = self.dec.get_batch_frames(8)
+            except Exception:
+                return                    # EOF（pynvvc 以异常/空列表表达）
+            if not frames:
+                return
+            for f in frames:
+                j = got
+                got += 1
+                if j == self._next_want:
+                    yield self._read_frame(f)
+            del frames
+
+    def _expected_frames(self):
+        """按标定选帧规则期望产出多少帧（元数据源帧数 → 选中帧数）。"""
+        if self.num_frames <= 0:
+            return 0
+        if self.stride == 1 and self.delta == 0:
+            return self.num_frames
+        return max(0, (self.num_frames - self.delta - 1) // self.stride + 1)
+
+    def read(self, size):
+        t1 = time.time()
+        try:
+            rgb = next(self._it)
+        except StopIteration:
+            self.waited += time.time() - t1
+            # 元数据说还有帧却解不出来了 → 中途断流，回退 FFmpeg 管道兜底
+            exp = self._expected_frames()
+            if self.num_frames > 0 and self._given < exp - 1:
+                raise _PynvvcDecodeError(
+                    f"pynvvc 提前断流: 解出 {self._given} 帧 < 期望 {exp}"
+                    f"（源 {self.num_frames} 帧）") from None
+            return b""
+        except Exception as e:
+            self.waited += time.time() - t1
+            raise _PynvvcDecodeError(f"pynvvc 解码中断: {e!r}") from e
+        self.waited += time.time() - t1        # 解码+拉帧段
+        t2 = time.time()
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)   # 唯一一次全帧拷贝(带通道交换)
+        self.waited += time.time() - t2        # 色彩转换段（计入 decode）
+        self._next_want += self.stride
+        self._given += 1
+        out = bgr.reshape(-1)                  # 1-D 视图: len == h*w*3, 零拷贝
+        if out.size != size:
+            raise _PynvvcDecodeError(
+                f"pynvvc 帧 {self.w}x{self.h} bytes={out.size} != 期望 {size}")
+        return out
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._it = None
+        self.dec = None          # 释放 NVDEC 会话（不支持重放, 用完即弃）
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
 # ---------------- filter ----------------
 class VideoFilter:
     def __init__(self, engine, conf, target_long, batch, detect_chunk,
                  max_fps, jpg_quality, score_name, verbose=False, jpg_workers=8,
                  down_min=0.46, pose_engine=None, pitch_max=25.0,
-                 pitch_min=-25.0, ear_min=0.25, gaze_max=0.12, gaze_dy_dev=0.0,
+                 pitch_min=-25.0, ear_min=0.25, min_face_h=0.0,
+                 gaze_max=0.12, gaze_dy_dev=0.0,
                  gaze_model="iris", gaze_model_path=None,
                  gaze_pitch_max=15.0, gaze_yaw_max=15.0,
-                 head_on=True, head_conf=0.30, head_model_path=None):
+                 head_on=True, head_conf=0.30, head_model_path=None,
+                 dedup=False, dedup_cut_lo=2.0, dedup_cut_hi=10.0,
+                 dedup_min_seg=2, dedup_max_seg=10, dedup_thumb=128,
+                 dedup_sharp_side=256, dedup_backups=2, dedup_max_mem=48.0,
+                 hw_decode=True, decode_mode="auto"):
         self.det = SCRFDTRTDetector(engine, max_batch=batch, conf_thres=conf)
         # 68 点 3D 姿态模型（可靠角度）；引擎缺失则回退 SCRFD 5 点 solvePnP
         self.pose68 = None
@@ -145,6 +464,10 @@ class VideoFilter:
         self.pitch_max = pitch_max     # 抬头上限：pitch > pitch_max 视为仰头，剔除（None=关）
         self.pitch_min = pitch_min     # 低头上限：pitch < pitch_min 视为低头，剔除（None=关）
         self.ear_min = ear_min         # 睁眼下限：min-EAR < ear_min 视为闭眼，剔除（None=0=关）
+        # 人脸最小尺寸（可调试，默认 0=关）：主脸框高 < min_face_h 像素 → 判 too_small
+        # 直接剔除，跳过 pose68/gaze/head 推理，不落 JPG。用于剔除"远处小脸"（小脸上
+        # 姿态估计不可靠）。阈值按目标视频实测标定；单位=人脸框高像素。
+        self.min_face_h = min_face_h
         self.gaze_dy_dev = gaze_dy_dev  # 纵向眼神 2-pass 闸门：|dy-本视频dy中位数|>此值 剔除（0=关）
         # Stage2 眼神闸门（级联第二级）：仅对 Stage1 全过的帧跑眼神估计，
         # 切"头正但眼不看镜头"的帧。两种实现（--gaze-model）：
@@ -179,6 +502,22 @@ class VideoFilter:
                 print(f"[filter] 人头闸门 = head2 (TensorRT) conf={head_conf}")
             except Exception as e:
                 print(f"[filter] !! 人头闸门(head2)加载失败，人头闸门关闭: {e}")
+        # 抽帧去重 + 段内选最佳帧（--dedup 开启时生效，默认关，行为与旧版一致）
+        self.dedup = dedup
+        self.dedup_cut_lo = dedup_cut_lo
+        self.dedup_cut_hi = dedup_cut_hi
+        self.dedup_min_seg = dedup_min_seg
+        self.dedup_max_seg = dedup_max_seg
+        self.dedup_thumb = dedup_thumb
+        self.dedup_sharp_side = dedup_sharp_side
+        self.dedup_backups = dedup_backups
+        self.dedup_max_mem = dedup_max_mem
+        # NVDEC GPU 硬解（--hw-decode，默认开）：dec_cmd 在 -i 前插 -hwaccel cuda；
+        # 硬解失败（ffmpeg 非 0 退出/异常）自动回退 CPU 软解重跑一次
+        self.hw_decode = hw_decode
+        # 解码帧源（--decode）: auto=GPU 管道, 失败自动回退 ffmpeg 落盘路径;
+        # gpu=仅 GPU 管道; ffmpeg=现有 3GB raw 落盘路径（旧行为, 一行未改）
+        self.decode_mode = decode_mode
 
     # 判定单帧：返回 (verdict, score, (yaw,pitch,roll), down_ratio, nfaces)
     #   no_face : 0 张脸
@@ -214,6 +553,84 @@ class VideoFilter:
             return "blink", score, pose, down, 1
         return "keep", score, pose, down, 1
 
+    def _gate_chain(self, frame, d, k, p68, dy_all):
+        """单帧完整闸门链：_judge → 低头复核 → Stage2 眼神 → Stage1.5 人头。
+        （从 process 主循环抽出的原闸门逻辑，dedup 的 backup 回退复用同一实现。）
+
+        p68: 本帧主脸的 68 点结果 ((yaw,pitch,roll), ear)，None 则 _judge 内回退
+             SCRFD 5 点 solvePnP（无 EAR）。
+        dy_all: 本视频所有测到 gaze 帧的 dy 收集（2-pass 基线），本方法在测到
+                gaze 时 append（resnet34 模式单位=度，iris 模式=归一化偏移）。
+
+        返回 (verdict, score, pose, down, nfaces, ear, gaze_mag, gaze_dy, nheads,
+              t_judge, t_gaze, t_head)；verdict 语义与 _judge 文档一致，另加
+              "down"（低头比复核）/ "gaze" / "multi_head"。
+        """
+        t1 = time.time()
+        verdict, score, pose, down, nfaces = self._judge(
+            d, k, p68[0] if p68 else None, p68[1] if p68 else None)
+        t_judge = time.time() - t1
+        ear = p68[1] if p68 else None
+        # 低头复核：单脸 pose 已合格，但 down_ratio < down_min → 按低头剔除
+        if (verdict == "keep" and self.down_min is not None
+                and down is not None and down < self.down_min):
+            verdict = "down"
+        # Stage2 眼神闸门：Stage1 全过（头基本正）的单脸帧
+        gaze_mag = None
+        gaze_dy = None
+        t_gaze = 0.0
+        if (verdict == "keep" and self.gaze is not None and nfaces == 1):
+            t1 = time.time()
+            top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
+            g = self.gaze.estimate(frame, d[top, :4])
+            t_gaze = time.time() - t1
+            if g is not None:
+                if self.gaze_model == "resnet34":
+                    # g = (pitch_deg, yaw_deg)。CSV 沿用 gaze 两列：
+                    # gaze_mag=|yaw|(度, 横向偏角)  gaze_dy=pitch(度, 正=仰)
+                    gpitch, gyaw = g
+                    gaze_mag, gaze_dy = abs(gyaw), gpitch
+                    dy_all.append(gaze_dy)   # 2-pass 基线（resnet 模式单位=度）
+                    if (abs(gpitch) > self.gaze_pitch_max
+                            or abs(gyaw) > self.gaze_yaw_max):
+                        verdict = "gaze"
+                else:
+                    gaze_mag, _gdx, gaze_dy = g
+                    dy_all.append(gaze_dy)
+                    if gaze_mag > self.gaze_max:
+                        verdict = "gaze"
+        # Stage1.5 人头闸门：其它闸门全过且单人脸，检出 >=2 个人头 → multi_head
+        nheads = None
+        t_head = 0.0
+        if (verdict == "keep" and nfaces == 1 and self.head is not None):
+            t1 = time.time()
+            _hb = self.head.detect(frame)
+            t_head = time.time() - t1
+            nheads = len(_hb)
+            if nheads >= 2:
+                verdict = "multi_head"
+        return (verdict, score, pose, down, nfaces, ear, gaze_mag,
+                gaze_dy, nheads, t_judge, t_gaze, t_head)
+
+    @staticmethod
+    def _decode_to_raw(dec_cmd, soft_cmd, hw_decode):
+        """跑解码命令把视频落 raw 盘。hw_decode=True 时 dec_cmd 带 -hwaccel cuda；
+        硬解失败（ffmpeg 非 0 退出/异常）→ 打印 WARNING 并用 soft_cmd（纯软解）
+        重跑一次兜底。返回实际使用的解码模式: 'hw' / 'cpu' / 'cpu-fallback'。"""
+        try:
+            subprocess.run(dec_cmd, check=True)
+            return "hw" if hw_decode else "cpu"
+        except (subprocess.SubprocessError, OSError) as e:
+            if not hw_decode:
+                raise
+            msg = str(e).splitlines()[0] if str(e) else "无输出"
+            print(f"  WARNING: NVDEC 硬解失败（{e.__class__.__name__}: {msg}），"
+                  f"回退 CPU 软解重跑", flush=True)
+            subprocess.run(soft_cmd, check=True)
+            print(f"  [decode] 回退软解完成，本次运行继续（hw -> cpu-fallback）",
+                  flush=True)
+            return "cpu-fallback"
+
     def process(self, video_path, out_dir, yaw_lim, shared_csv=False):
         self.yaw_lim = yaw_lim
         w, h, fps, nframes = probe(video_path)
@@ -225,24 +642,84 @@ class VideoFilter:
         apply_fps = bool(self.max_fps and self.max_fps > 0 and fps > self.max_fps)
         dec_fps = self.max_fps if apply_fps else fps
 
-        # 临时 raw 文件：Windows 下 Python 读管道极慢(~30MB/s)，读文件快~90x，
-        # 且先落盘再读可彻底消除 ffmpeg stdin 管道背压死锁。
-        fd_tmp, tmp_raw = tempfile.mkstemp(suffix=".raw", prefix=f"filt_{stem}_")
-        os.close(fd_tmp)
+        mode = self.decode_mode
+        # 解码帧源尝试顺序（失败逐级整体回退重跑，最终兜底 ffmpeg 落盘路径）：
+        #   auto   : FFmpeg NVDEC 管道 → ffmpeg 落盘（默认，行为与旧版一致）
+        #   pynvvc : PyNvVideoCodec 硬解 → FFmpeg NVDEC 管道 → ffmpeg 落盘
+        #   gpu    : 仅 FFmpeg NVDEC 管道；ffmpeg: 仅落盘路径（旧行为）
+        _SRC_LABEL = {"pynvvc": "pynvvc(NVDEC) 帧源", "pipe": "FFmpeg NVDEC 管道",
+                      "file": "ffmpeg 落盘"}
+        chain = {"auto": ("pipe", "file"),
+                 "pynvvc": ("pynvvc", "pipe", "file"),
+                 "gpu": ("pipe",),
+                 "ffmpeg": ("file",)}[mode]
+        last_err = None
+        for i, kind in enumerate(chain):
+            try:
+                return self._run_pass(video_path, out_dir, yaw_lim, shared_csv,
+                                      w, h, size, fps, apply_fps, dec_fps,
+                                      nframes, stem,
+                                      use_pipe=(kind == "pipe"),
+                                      use_pynvvc=(kind == "pynvvc"))
+            except (_PynvvcDecodeError, _PipeDecodeError) as e:
+                last_err = e
+                msg = str(e).splitlines()[0] if str(e) else "无输出"
+                note = ""
+                if i + 1 < len(chain):
+                    note = f"，回退 {_SRC_LABEL[chain[i + 1]]}路径重跑"
+                print(f"  WARNING: {_SRC_LABEL[kind]}解码失败"
+                      f"（{e.__class__.__name__}: {msg}）{note}", flush=True)
+        raise last_err
 
-        dec_cmd = ["ffmpeg", "-v", "error", "-i", video_path]
-        if apply_fps:
-            dec_cmd += ["-vf", f"fps={dec_fps:g}"]
-        dec_cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-y", tmp_raw]
+    def _run_pass(self, video_path, out_dir, yaw_lim, shared_csv,
+                  w, h, size, fps, apply_fps, dec_fps, nframes, stem, use_pipe,
+                  use_pynvvc=False):
+        # 帧源: use_pynvvc=True → PyNvVideoCodec(NVDEC) 硬解帧源（自抽帧 + RGB→BGR）；
+        #       use_pipe=True → 与落盘路径【同一条 ffmpeg 命令】(仅输出改 pipe:1)，
+        #       NVDEC+GPU 转换直出 bgr24 到内存，不落 3GB raw（输出 bit-exact）；
+        #       use_pipe=False → 现有落盘路径（原代码原样保留）。
+        if use_pynvvc:
+            # 建解码器/标定失败抛 _PynvvcDecodeError，由 process() 回退下一路帧源
+            f_src = _PynvvcSource(video_path, w, h, fps, self.max_fps)
+            tmp_raw = None
+        elif use_pipe:
+            _tail = []
+            if apply_fps:
+                _tail += ["-vf", f"fps={dec_fps:g}"]
+            _tail += ["-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
+            pipe_cmd = (["ffmpeg", "-v", "error", "-hwaccel", "cuda", "-i", video_path]
+                        if self.hw_decode
+                        else ["ffmpeg", "-v", "error", "-i", video_path]) + _tail
+            f_src = _PipeRaw(pipe_cmd)
+            tmp_raw = None
+        else:
+            f_src = None
+            # 临时 raw 文件：Windows 下 Python 读管道极慢(~30MB/s)，读文件快~90x，
+            # 且先落盘再读可彻底消除 ffmpeg stdin 管道背压死锁。
+            fd_tmp, tmp_raw = tempfile.mkstemp(suffix=".raw", prefix=f"filt_{stem}_")
+            os.close(fd_tmp)
+            # 解码命令：hw_decode=True 时 -i 前插 -hwaccel cuda（NVDEC）；
+            # 另备一条无 -hwaccel 的软解命令，硬解失败时兜底重跑
+            _tail = []
+            if apply_fps:
+                _tail += ["-vf", f"fps={dec_fps:g}"]
+            _tail += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-y", tmp_raw]
+            dec_cmd = (["ffmpeg", "-v", "error", "-hwaccel", "cuda", "-i", video_path]
+                       if self.hw_decode else ["ffmpeg", "-v", "error", "-i", video_path]) + _tail
+            soft_cmd = ["ffmpeg", "-v", "error", "-i", video_path] + _tail
 
         if self.verbose:
+            _src = "pynvvc" if use_pynvvc else ("pipe" if use_pipe else "file")
             print(f"  decode {os.path.basename(video_path)}  {w}x{h}  src_fps={fps:.3f} "
-                  f"-> dec_fps={dec_fps:.3f}{' (downsampled)' if apply_fps else ''}  ~{nframes} frames")
+                  f"-> dec_fps={dec_fps:.3f}{' (downsampled)' if apply_fps else ''}  "
+                  f"~{nframes} frames  hwdec={'cuda' if self.hw_decode else 'cpu'}  "
+                  f"src={_src}")
 
         t0 = time.time()
         frame_no = kept = drop_noface = drop_pose = drop_down = drop_multi = 0
         drop_up = drop_blink = drop_downp = drop_gaze = drop_gazedown = 0
         drop_head = 0
+        drop_toosmall = 0
         t_dec = t_read = t_det = t_judge = t_gaze = t_write = 0.0
         t_head = 0.0
         ex = ThreadPoolExecutor(max_workers=self.jpg_workers)
@@ -252,137 +729,390 @@ class VideoFilter:
         report = []
         dy_all = []    # 所有测到 gaze 的帧的 dy（2-pass 基线=其中位数）
         dy_gate = []   # (帧号, 写出路径, dy)：keep 候选帧，循环后统一套用 dy 闸门
+        # dedup 统计（未开 --dedup 时全为 0，不参与汇总）
+        decoded_frames = 0
+        dedup_rows = []   # (frame, diff, seg_id, seg_start, seg_end, sharp, is_rep)
+        seg_stats = {"segs": 0, "sent": 0, "reps": 0, "bk_judged": 0,
+                     "sec_judged": 0, "sec_hits": 0,
+                     "drop_seg": 0, "backup_hits": 0}
+        dedup_dy_hits = 0
         try:
-            t1 = time.time()
-            subprocess.run(dec_cmd, check=True)
-            t_dec = time.time() - t1
+            if use_pynvvc:
+                dec_mode = "pynvvc"
+                t_dec = 0.0
+            elif use_pipe:
+                dec_mode = "pipe"
+                t_dec = 0.0
+            else:
+                t1 = time.time()
+                dec_mode = self._decode_to_raw(dec_cmd, soft_cmd, self.hw_decode)
+                t_dec = time.time() - t1
 
-            with open(tmp_raw, "rb", buffering=0) as f:
-                while True:
-                    t1 = time.time()
-                    chunk = []
-                    for _ in range(self.detect_chunk):
-                        buf = f.read(size)
-                        if len(buf) < size:
-                            break
-                        chunk.append(np.frombuffer(buf, np.uint8).reshape(h, w, 3))
-                    t_read += time.time() - t1
-                    if not chunk:
-                        break
+            if self.dedup:
+                # ---------- dedup 模式 ----------
+                # 连续相似帧分段、段内选最清晰 rep 送检；快速动作逐帧独立成段
+                # → 不漏帧。段关闭才产出；rep 被闸门 drop 时按清晰度次序对
+                # backups 补跑闸门取第一个 keep，全 fail 计 drop_seg。
+                # 输出文件名仍用【原始解码帧号】。
+                deduper = FrameDedupSelector(
+                    cut_lo=self.dedup_cut_lo, cut_hi=self.dedup_cut_hi,
+                    min_seg=self.dedup_min_seg, max_seg=self.dedup_max_seg,
+                    thumb_side=self.dedup_thumb,
+                    sharp_side=self.dedup_sharp_side,
+                    n_backups=self.dedup_backups,
+                    max_mem_mb=self.dedup_max_mem)
+                segs = []   # 已关闭待送检段: (rep_frame, rep_idx, backups, meta)
+                SEG_Q_CAP = max(8, self.detect_chunk // 4)
+                SEG_Q_BYTES = 160 * 1024 * 1024  # 挂起段(全段帧)内存上限
+                # 解码帧号→秒 的换算(段内跨秒补覆盖用); fps 探测失败时按 10 兜底
+                sec_fps = dec_fps if (dec_fps and dec_fps > 0) else 10.0
 
+                def _count_drop(vd):
+                    nonlocal drop_noface, drop_pose, drop_down, drop_multi
+                    nonlocal drop_up, drop_blink, drop_downp, drop_gaze, drop_head
+                    nonlocal drop_toosmall
+                    if vd == "no_face":
+                        drop_noface += 1
+                    elif vd == "down":
+                        drop_down += 1
+                    elif vd == "downp":
+                        drop_downp += 1
+                    elif vd == "multi":
+                        drop_multi += 1
+                    elif vd == "up":
+                        drop_up += 1
+                    elif vd == "blink":
+                        drop_blink += 1
+                    elif vd == "gaze":
+                        drop_gaze += 1
+                    elif vd == "multi_head":
+                        drop_head += 1
+                    elif vd == "too_small":
+                        drop_toosmall += 1
+                    else:
+                        drop_pose += 1
+
+                def _detect_batch(frames):
+                    """一列帧批量 SCRFD 检测 + 68 点姿态。
+                    返回 (dets, kpss, pose_map)，pose_map[批内序号]=((yaw,pitch,roll),ear)。"""
+                    nonlocal t_det
                     t1 = time.time()
                     dets, kpss = self.det.detect(
-                        chunk, threshold=self.conf, target_long=self.target_long,
+                        frames, threshold=self.conf,
+                        target_long=self.target_long,
                         pipeline=True, gpu_preprocess=True)
                     t_det += time.time() - t1
-
-                    # 68 点姿态：对本块所有 >=1 脸帧的主脸【批量】计算（整块一次
-                    # TRT 调用，~ms 级）。pose_map[块内序号] = ((yaw,pitch,roll), ear)。
+                    # too_small 帧跳过 pose68 推理（min_face_h 开启时）
+                    ts_mask = set()
+                    if self.min_face_h and self.min_face_h > 0:
+                        for i, d in enumerate(dets):
+                            if len(d) > 0:
+                                top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
+                                if (d[top, 3] - d[top, 1]) < self.min_face_h:
+                                    ts_mask.add(i)
                     pose_map = {}
                     if self.pose68 is not None:
                         items = []
-                        for i, (fr, d) in enumerate(zip(chunk, dets)):
-                            if len(d) > 0:
+                        for i, (fr, d) in enumerate(zip(frames, dets)):
+                            if len(d) > 0 and i not in ts_mask:
                                 top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
                                 items.append((i, fr, d[top, :4]))
                         if items:
                             poses = self.pose68.estimate_batch(
                                 [(fr, bb) for _, fr, bb in items])
                             pose_map = {i: p for (i, _, _), p in zip(items, poses)}
+                    return dets, kpss, pose_map
 
-                    for i, (frame, d, k) in enumerate(zip(chunk, dets, kpss)):
-                        frame_no += 1
-                        t1 = time.time()
-                        _p = pose_map.get(i)          # ((yaw,pitch,roll), ear) 或 None
-                        verdict, score, pose, down, nfaces = self._judge(
-                            d, k, _p[0] if _p else None,
-                            _p[1] if _p else None)
-                        t_judge += time.time() - t1
-                        yaw, pitch, roll = pose
-                        ear = _p[1] if _p else None
-                        # 低头复核：单脸 pose 已合格，但 down_ratio < down_min → 按低头剔除
-                        # （down_min 本身保留，即 down >= down_min 才 keep）
-                        if (verdict == "keep" and self.down_min is not None
-                                and down is not None and down < self.down_min):
-                            verdict = "down"
-                        # Stage2 眼神闸门：Stage1 全过（头基本正）的单脸帧，用
-                        # MediaPipe 虹膜偏移切"头正但眼不看镜头"的帧。
-                        gaze_mag = None
-                        gaze_dy = None
-                        if (verdict == "keep" and self.gaze is not None and nfaces == 1):
-                            t1 = time.time()
-                            top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
-                            g = self.gaze.estimate(frame, d[top, :4])
-                            t_gaze += time.time() - t1
-                            if g is not None:
-                                if self.gaze_model == "resnet34":
-                                    # g = (pitch_deg, yaw_deg)。CSV 沿用 gaze 两列：
-                                    # gaze_mag=|yaw|(度, 横向偏角)  gaze_dy=pitch(度, 正=仰)
-                                    gpitch, gyaw = g
-                                    gaze_mag, gaze_dy = abs(gyaw), gpitch
-                                    dy_all.append(gaze_dy)   # 2-pass 基线（resnet 模式单位=度）
-                                    if (abs(gpitch) > self.gaze_pitch_max
-                                            or abs(gyaw) > self.gaze_yaw_max):
-                                        verdict = "gaze"
-                                else:
-                                    gaze_mag, _gdx, gaze_dy = g
-                                    dy_all.append(gaze_dy)
-                                    if gaze_mag > self.gaze_max:
-                                        verdict = "gaze"
-                        # Stage1.5 人头闸门：其它闸门全过且单人脸的帧，画面里
-                        # 检出 >= 2 个人头（含主角的头）→ 判 multi_head 丢弃
-                        nheads = None
-                        if (verdict == "keep" and nfaces == 1
-                                and self.head is not None):
-                            t1 = time.time()
-                            _hb = self.head.detect(frame)
-                            t_head += time.time() - t1
-                            nheads = len(_hb)
-                            if nheads >= 2:
-                                verdict = "multi_head"
-                        if self.score_name:
-                            report.append([frame_no, verdict, score, yaw, pitch,
-                                           roll, down, nfaces, ear, gaze_mag,
-                                           gaze_dy, nheads])
-                        if verdict == "keep":
-                            base = f"{stem}_{frame_no:05d}"
-                            # 临时命名：原名_置信度_yaw_pitch_roll（68 点模型值，
-                            # 供手动阈值确认，确认后改回 <stem>_kept_<frame>.jpg）
-                            name = (f"{base}_{score:.2f}_{yaw:.0f}_{pitch:.0f}_{roll:.0f}.jpg"
-                                    if self.score_name else f"{base}.jpg")
-                            # JPEG 编码丢给线程池（libjpeg 释放 GIL），与后续
-                            # 块的 read/detect 重叠，不再阻塞主线程。
-                            futures.append(ex.submit(
-                                cv2.imwrite, os.path.join(out_dir, name), frame,
-                                [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpg_q)]))
-                            kept += 1
-                            if self.gaze_dy_dev > 0 and gaze_dy is not None:
-                                dy_gate.append((frame_no, os.path.join(out_dir, name), gaze_dy))
+                def _judge_and_write(frame, idx, d, k, p68):
+                    """单帧跑闸门链；keep 则写出（文件名用原始解码帧号 idx）
+                    返回 True；否则计 drop 返回 False。"""
+                    nonlocal frame_no, kept, t_judge, t_gaze, t_head, drop_toosmall
+                    # too_small 直接判，跳过 pose/gaze/head（_gate_chain 内含昂贵闸门）
+                    if (self.min_face_h and self.min_face_h > 0
+                            and len(d) > 0):
+                        top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
+                        if (d[top, 3] - d[top, 1]) < self.min_face_h:
+                            frame_no += 1
+                            score = float(d[top, 4])
+                            if self.score_name:
+                                report.append([idx, "too_small", score, 0.0, 0.0,
+                                               0.0, None, len(d), None, None,
+                                               None, None])
+                            drop_toosmall += 1
                             if self.verbose:
-                                print(f"    #{frame_no:05d} KEEP  score={score:.3f} "
-                                      f"yaw={yaw:.0f} pit={pitch:.0f} rol={roll:.0f} "
-                                      f"down={down:.2f}")
+                                print(f"    #{idx:05d} drop  (too_small  "
+                                      f"fh={d[top, 3]-d[top, 1]:.0f})")
+                            return False
+                    (verdict, score, pose, down, nfaces, ear, gaze_mag,
+                     gaze_dy, nheads, _tj, _tg, _th) = self._gate_chain(
+                         frame, d, k, p68, dy_all)
+                    t_judge += _tj
+                    t_gaze += _tg
+                    t_head += _th
+                    frame_no += 1   # dedup 模式下 = 送检帧数(reps + backup 补判)
+                    yaw, pitch, roll = pose
+                    if self.score_name:
+                        report.append([idx, verdict, score, yaw, pitch,
+                                       roll, down, nfaces, ear, gaze_mag,
+                                       gaze_dy, nheads])
+                    if verdict == "keep":
+                        base = f"{stem}_{idx:05d}"
+                        name = (f"{base}_{score:.2f}_{yaw:.0f}_{pitch:.0f}_{roll:.0f}.jpg"
+                                if self.score_name else f"{base}.jpg")
+                        futures.append(ex.submit(
+                            cv2.imwrite, os.path.join(out_dir, name), frame,
+                            [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpg_q)]))
+                        kept += 1
+                        if self.gaze_dy_dev > 0 and gaze_dy is not None:
+                            dy_gate.append((idx, os.path.join(out_dir, name), gaze_dy))
+                        if self.verbose:
+                            print(f"    #{idx:05d} KEEP  score={score:.3f} "
+                                  f"yaw={yaw:.0f} pit={pitch:.0f} rol={roll:.0f} "
+                                  f"down={down:.2f}")
+                        return True
+                    _count_drop(verdict)
+                    if self.verbose:
+                        print(f"    #{idx:05d} drop  ({verdict}  down={down})")
+                    return False
+
+                def _process_seg_batch(sb):
+                    """一批已关闭段: reps 批量送检→闸门。
+                    - rep keep: 段内每个"与 rep 不同秒"的秒, 按清晰度降序逐一补判
+                      该秒的帧, 命中 keep 即停(early stop)——眼神/头部在秒内变化快,
+                      只补最清晰一帧不够(实证: 154 第15秒);
+                    - rep drop: 段内剩余帧按清晰度降序逐一补判, 命中第一个 keep
+                      即停(early stop), 全 fail 计 drop_seg。
+                    两者合起来: 每个解码秒的候选帧要么有 keep 的 rep, 要么该秒在
+                    段内的帧被全扫过 → 覆盖与 A 同帧集等价(仅剩 dy 2-pass 基线差异
+                    这一 v1 已知项)。
+                    补判帧合并成一次批量 detect + pose68（补判只在 rep 结果出来
+                    后发生; gaze/head 昂贵闸门只对过 Stage1 的帧跑）。"""
+                    seg_stats["segs"] += len(sb)
+                    rep_frames = [s[0] for s in sb]
+                    dets, kpss, pose_map = _detect_batch(rep_frames)
+                    jobs = []         # job_pos → (kind, satisfied_set)
+                    extra_items = []  # (job_pos, kind, sec_or_None, frame, idx)
+                    for si, seg in enumerate(sb):
+                        _, rep_idx, _bk, meta = seg
+                        seg_stats["sent"] += 1
+                        seg_stats["reps"] += 1
+                        ok = _judge_and_write(rep_frames[si], rep_idx,
+                                               dets[si], kpss[si],
+                                               pose_map.get(si))
+                        job_pos = len(jobs)
+                        if ok:
+                            # 秒号约定与逐秒直方图一致: sec = frame // dec_fps
+                            rep_sec = rep_idx // sec_fps
+                            by_sec = {}   # sec → [(frame, idx), ...] 清晰度降序
+                            for (idx, _sh, fr) in meta["frames"]:
+                                s2 = idx // sec_fps
+                                if s2 != rep_sec:
+                                    by_sec.setdefault(s2, []).append((fr, idx))
+                            if by_sec:
+                                jobs.append(("sec", set()))
+                                for s2 in sorted(by_sec):
+                                    for (fr, idx) in by_sec[s2]:
+                                        extra_items.append(
+                                            (job_pos, "sec", s2, fr, idx))
                         else:
-                            if verdict == "no_face":
-                                drop_noface += 1
-                            elif verdict == "down":
-                                drop_down += 1
-                            elif verdict == "downp":
-                                drop_downp += 1
-                            elif verdict == "multi":
-                                drop_multi += 1
-                            elif verdict == "up":
-                                drop_up += 1
-                            elif verdict == "blink":
-                                drop_blink += 1
-                            elif verdict == "gaze":
-                                drop_gaze += 1
-                            elif verdict == "multi_head":
-                                drop_head += 1
+                            jobs.append(("scan", set()))
+                            for (idx, _sh, fr) in meta["frames"]:
+                                if idx != rep_idx:
+                                    extra_items.append(
+                                        (job_pos, "scan", None, fr, idx))
+                    solved_scan = set()
+                    if extra_items:
+                        dets_e, kpss_e, pose_map_e = _detect_batch(
+                            [it[3] for it in extra_items])
+                        for ei, (job_pos, kind, s2, fr, idx) in enumerate(extra_items):
+                            if kind == "scan" and job_pos in solved_scan:
+                                continue
+                            if kind == "sec" and s2 in jobs[job_pos][1]:
+                                continue   # 该秒已有 keep, 剩余候选跳过
+                            seg_stats["sent"] += 1
+                            if kind == "scan":
+                                seg_stats["bk_judged"] += 1
                             else:
-                                drop_pose += 1
-                            if self.verbose:
-                                print(f"    #{frame_no:05d} drop  ({verdict}  down={down})")
+                                seg_stats["sec_judged"] += 1
+                            if _judge_and_write(fr, idx, dets_e[ei], kpss_e[ei],
+                                                pose_map_e.get(ei)):
+                                if kind == "scan":
+                                    seg_stats["backup_hits"] += 1
+                                    solved_scan.add(job_pos)
+                                else:
+                                    seg_stats["sec_hits"] += 1
+                                    jobs[job_pos][1].add(s2)
+                    for job_pos, (kind, _sat) in enumerate(jobs):
+                        if kind == "scan" and job_pos not in solved_scan:
+                            seg_stats["drop_seg"] += 1
+
+                def _drain_segs():
+                    while (len(segs) >= SEG_Q_CAP
+                           or sum(s[3]["nbytes_total"] for s in segs) > SEG_Q_BYTES):
+                        n = min(len(segs), self.detect_chunk)
+                        _process_seg_batch(segs[:n])
+                        del segs[:n]
+
+                with (f_src if f_src is not None
+                      else open(tmp_raw, "rb", buffering=0)) as f:
+                    while True:
+                        t1 = time.time()
+                        chunk = []
+                        for _ in range(self.detect_chunk):
+                            buf = f.read(size)
+                            if len(buf) < size:
+                                break
+                            chunk.append(np.frombuffer(buf, np.uint8).reshape(h, w, 3))
+                        t_read += time.time() - t1
+                        if not chunk:
+                            break
+                        for fr in chunk:
+                            decoded_frames += 1
+                            res = deduper.push(fr, decoded_frames)
+                            if res is not None:
+                                rep_fr, rep_idx, backups, meta = res
+                                segs.append((rep_fr, rep_idx, backups, meta))
+                                for (fi, dif, sh, isrep) in meta["rows"]:
+                                    dedup_rows.append(
+                                        (fi, dif, meta["seg_id"],
+                                         meta["seg_start"], meta["seg_end"],
+                                         sh, isrep))
+                        _drain_segs()
+                    res = deduper.flush()   # EOF 强关最后一段
+                    if res is not None:
+                        rep_fr, rep_idx, backups, meta = res
+                        segs.append((rep_fr, rep_idx, backups, meta))
+                        for (fi, dif, sh, isrep) in meta["rows"]:
+                            dedup_rows.append(
+                                (fi, dif, meta["seg_id"],
+                                 meta["seg_start"], meta["seg_end"],
+                                 sh, isrep))
+                    # 排空剩余段：EOF 后不再依赖触发条件，否则尾部不满阈值
+                    # 的段会永远留在队列里不被送检(丢帧/丢秒)
+                    while segs:
+                        n = min(len(segs), self.detect_chunk)
+                        _process_seg_batch(segs[:n])
+                        del segs[:n]
+            else:
+                with (f_src if f_src is not None
+                      else open(tmp_raw, "rb", buffering=0)) as f:
+                    while True:
+                        t1 = time.time()
+                        chunk = []
+                        for _ in range(self.detect_chunk):
+                            buf = f.read(size)
+                            if len(buf) < size:
+                                break
+                            chunk.append(np.frombuffer(buf, np.uint8).reshape(h, w, 3))
+                        t_read += time.time() - t1
+                        if not chunk:
+                            break
+
+                        t1 = time.time()
+                        dets, kpss = self.det.detect(
+                            chunk, threshold=self.conf, target_long=self.target_long,
+                            pipeline=True, gpu_preprocess=True)
+                        t_det += time.time() - t1
+
+                        # 人脸最小尺寸闸门（可调试，默认关）：主脸框高 < min_face_h
+                        # → 本块内标 too_small，跳过 pose68/gaze/head 推理。
+                        ts_mask = set()
+                        if self.min_face_h and self.min_face_h > 0:
+                            for i, d in enumerate(dets):
+                                if len(d) > 0:
+                                    top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
+                                    if (d[top, 3] - d[top, 1]) < self.min_face_h:
+                                        ts_mask.add(i)
+
+                        # 68 点姿态：对本块所有 >=1 脸帧的主脸【批量】计算（整块一次
+                        # TRT 调用，~ms 级）。pose_map[块内序号] = ((yaw,pitch,roll), ear)。
+                        # too_small 帧不送 pose68（省推理）。
+                        pose_map = {}
+                        if self.pose68 is not None:
+                            items = []
+                            for i, (fr, d) in enumerate(zip(chunk, dets)):
+                                if len(d) > 0 and i not in ts_mask:
+                                    top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
+                                    items.append((i, fr, d[top, :4]))
+                            if items:
+                                poses = self.pose68.estimate_batch(
+                                    [(fr, bb) for _, fr, bb in items])
+                                pose_map = {i: p for (i, _, _), p in zip(items, poses)}
+
+                        for i, (frame, d, k) in enumerate(zip(chunk, dets, kpss)):
+                            frame_no += 1
+                            # too_small 直接判：跳过 pose/gaze/head 推理，不落 JPG
+                            if (self.min_face_h and self.min_face_h > 0
+                                    and i in ts_mask):
+                                top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
+                                score = float(d[top, 4])
+                                if self.score_name:
+                                    report.append([frame_no, "too_small", score,
+                                                   0.0, 0.0, 0.0, None, len(d),
+                                                   None, None, None, None])
+                                drop_toosmall += 1
+                                if self.verbose:
+                                    print(f"    #{frame_no:05d} drop  (too_small  "
+                                          f"fh={d[top, 3]-d[top, 1]:.0f})")
+                                continue
+                            _p = pose_map.get(i)          # ((yaw,pitch,roll), ear) 或 None
+                            (verdict, score, pose, down, nfaces, ear, gaze_mag,
+                             gaze_dy, nheads, _tj, _tg, _th) = self._gate_chain(
+                                 frame, d, k, _p, dy_all)
+                            t_judge += _tj
+                            t_gaze += _tg
+                            t_head += _th
+                            yaw, pitch, roll = pose
+                            if self.score_name:
+                                report.append([frame_no, verdict, score, yaw, pitch,
+                                               roll, down, nfaces, ear, gaze_mag,
+                                               gaze_dy, nheads])
+                            if verdict == "keep":
+                                base = f"{stem}_{frame_no:05d}"
+                                # 临时命名：原名_置信度_yaw_pitch_roll（68 点模型值，
+                                # 供手动阈值确认，确认后改回 <stem>_kept_<frame>.jpg）
+                                name = (f"{base}_{score:.2f}_{yaw:.0f}_{pitch:.0f}_{roll:.0f}.jpg"
+                                        if self.score_name else f"{base}.jpg")
+                                # JPEG 编码丢给线程池（libjpeg 释放 GIL），与后续
+                                # 块的 read/detect 重叠，不再阻塞主线程。
+                                futures.append(ex.submit(
+                                    cv2.imwrite, os.path.join(out_dir, name), frame,
+                                    [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpg_q)]))
+                                kept += 1
+                                if self.gaze_dy_dev > 0 and gaze_dy is not None:
+                                    dy_gate.append((frame_no, os.path.join(out_dir, name), gaze_dy))
+                                if self.verbose:
+                                    print(f"    #{frame_no:05d} KEEP  score={score:.3f} "
+                                          f"yaw={yaw:.0f} pit={pitch:.0f} rol={roll:.0f} "
+                                          f"down={down:.2f}")
+                            else:
+                                if verdict == "no_face":
+                                    drop_noface += 1
+                                elif verdict == "down":
+                                    drop_down += 1
+                                elif verdict == "downp":
+                                    drop_downp += 1
+                                elif verdict == "multi":
+                                    drop_multi += 1
+                                elif verdict == "up":
+                                    drop_up += 1
+                                elif verdict == "blink":
+                                    drop_blink += 1
+                                elif verdict == "gaze":
+                                    drop_gaze += 1
+                                elif verdict == "multi_head":
+                                    drop_head += 1
+                                else:
+                                    drop_pose += 1
+                                if self.verbose:
+                                    print(f"    #{frame_no:05d} drop  ({verdict}  down={down})")
+
+            if use_pipe or use_pynvvc:
+                # 帧源内部等待时间（管道: ffmpeg 解码+GPU 转换+D2H+管道传输；
+                # pynvvc: NVDEC 解码+拉帧+RGB→BGR）计入 decode 段；
+                # read 段只留 numpy 物化（≈0）
+                t_dec += f_src.waited
+                t_read = max(0.0, t_read - f_src.waited)
 
             # 排空 JPEG 线程池（主线程提交完后大多已编码完，这里只剩尾部等待）
             t1 = time.time()
@@ -405,6 +1135,8 @@ class VideoFilter:
                 if hit:
                     kept -= len(hit)
                     drop_gazedown += len(hit)
+                    if self.dedup:
+                        dedup_dy_hits += len(hit)   # dedup 开启且 dy 闸门命中(汇总统计)
                     for r in report:
                         if r[0] in hit:
                             r[1] = "gazedown"
@@ -426,30 +1158,65 @@ class VideoFilter:
                         gdt = f"{gd:.3f}" if gd is not None else ""
                         nht = f"{nh}" if nh is not None else ""
                         cf.write(f"{no},{vd},{sc:.3f},{y:.1f},{p:.1f},{r:.1f},{dtag},{nf},{etag},{gtag},{gdt},{nht}\n")
+            if dedup_rows:
+                # 仅 --dedup 时产出（与 pose_report.csv 并存，不动后者格式）：
+                # 逐解码帧的段切分/清晰度明细，供调 cut_lo/cut_hi
+                with open(os.path.join(out_dir, "dedup_report.csv"), "w",
+                          encoding="utf-8") as dfh:
+                    dfh.write("frame,diff,seg_id,seg_start,seg_end,sharp,is_rep\n")
+                    for (fi, dif, sid, s0, s1, sh, isrep) in dedup_rows:
+                        dfh.write(f"{fi},{dif:.3f},{sid},{s0},{s1},{sh:.1f},{isrep}\n")
         finally:
+            if f_src is not None:
+                f_src.close()
             ex.shutdown(wait=True)
-            try:
-                os.remove(tmp_raw)
-            except OSError:
-                pass
+            if tmp_raw is not None:
+                try:
+                    os.remove(tmp_raw)
+                except OSError:
+                    pass
 
         dt = time.time() - t0
         dm = f"{self.down_min:g}" if self.down_min is not None else "?"
-        print(f"  {os.path.basename(video_path)}: {frame_no} frames -> "
+        if self.dedup:
+            head_label = f"decoded {decoded_frames} -> sent {frame_no}"
+            rate = decoded_frames / dt
+        else:
+            head_label = f"{frame_no} frames"
+            rate = frame_no / dt
+        print(f"  {os.path.basename(video_path)}: {head_label} -> "
               f"kept {kept}  (drop {drop_noface} no-face, {drop_pose} pose, "
               f"{drop_up} up, {drop_downp} downp, {drop_gaze} gaze, "
               f"{drop_gazedown} gazedown, {drop_blink} blink, "
               f"{drop_down} down<{dm}, {drop_multi} multi, "
-              f"{drop_head} multi-head)  "
-              f"in {dt:.1f}s ({frame_no / dt:.0f} fps)  -> {os.path.abspath(out_dir)}")
+              f"{drop_head} multi-head, {drop_toosmall} too-small)  "
+              f"in {dt:.1f}s ({rate:.0f} fps)  -> {os.path.abspath(out_dir)}")
         print(f"    [breakdown] decode={t_dec:5.2f}s  read={t_read:5.2f}s  "
               f"detect={t_det:5.2f}s  judge={t_judge:5.2f}s  gaze={t_gaze:5.2f}s  "
               f"head={t_head:5.2f}s  imwrite={t_write:5.2f}s ({kept} frames)")
-        return {"frames": frame_no, "kept": kept, "no_face": drop_noface,
-                "pose": drop_pose, "down": drop_down, "multi": drop_multi,
-                "up": drop_up, "downp": drop_downp, "gaze": drop_gaze,
-                "gazedown": drop_gazedown, "blink": drop_blink,
-                "head": drop_head, "seconds": dt}
+        if self.dedup:
+            print(f"    [dedup] segments={seg_stats['segs']}  "
+                  f"reps={seg_stats['reps']}  "
+                  f"backup-judged={seg_stats['bk_judged']}  "
+                  f"backup-hit={seg_stats['backup_hits']}  "
+                  f"sec-judged={seg_stats['sec_judged']}  "
+                  f"sec-hit={seg_stats['sec_hits']}  "
+                  f"drop_seg={seg_stats['drop_seg']}  "
+                  f"compression={decoded_frames / max(frame_no, 1):.2f}x  "
+                  f"dy-gate-hits(dedup kept)={dedup_dy_hits}")
+        out = {"frames": frame_no, "kept": kept, "no_face": drop_noface,
+               "decode_mode": dec_mode,
+               "pose": drop_pose, "down": drop_down, "multi": drop_multi,
+               "up": drop_up, "downp": drop_downp, "gaze": drop_gaze,
+               "gazedown": drop_gazedown, "blink": drop_blink,
+               "head": drop_head, "toosmall": drop_toosmall,
+               "seconds": dt}
+        if self.dedup:
+            out.update({"decoded": decoded_frames, "segments": seg_stats["segs"],
+                        "drop_seg": seg_stats["drop_seg"],
+                        "backup_hits": seg_stats["backup_hits"],
+                        "dedup_dy_hits": dedup_dy_hits})
+        return out
 
     def run(self, targets, yaw_lim, shared_csv=False):
         """targets: list of (video_path, out_dir). shared_csv: 多视频共享同一
@@ -614,6 +1381,11 @@ def main():
     ap.add_argument("--ear-min", type=float, default=0.25,
                     help="睁眼下限：min-EAR < 此值视为闭眼/眯眼剔除（睁眼~0.30-0.39；"
                          "0=关闭）")
+    ap.add_argument("--min-face-h", type=float, default=0.0,
+                    help="人脸最小尺寸（可调试，默认 0=关闭；单位=人脸框高像素）："
+                         "主脸框高 < 此值的帧判 too_small 直接剔除，跳过姿态/眼神/人头"
+                         "闸门推理、不落 JPG。用于剔除'远处小脸'（小脸上 1k3d68 姿态估计"
+                         "不可靠）。阈值按目标视频实测标定；0=关闭，代码路径与旧版一致")
     ap.add_argument("--gaze-model", choices=["iris", "resnet34"], default="resnet34",
                     help="Stage2 眼神闸门实现（默认 resnet34，018/032/035 A/B 验证优于 iris）："
                          "resnet34=yakhyo MobileGaze 全脸注视角（TRT，本地 resnet34_gaze_fp16.engine，"
@@ -662,6 +1434,42 @@ def main():
                     help="frames per detect() call")
     ap.add_argument("--max-fps", type=float, default=10.0,
                     help="if source fps > this, uniformly decode at this fps (0=off)")
+    ap.add_argument("--hw-decode", action=argparse.BooleanOptionalAction, default=True,
+                    help="NVDEC GPU 硬解（默认开：ffmpeg 在 -i 前加 -hwaccel cuda；"
+                         "--no-hw-decode 回 CPU 软解，即旧行为）。硬解失败"
+                         "（非 0 退出/异常）自动 WARNING 并回退软解重跑")
+    ap.add_argument("--decode", choices=["auto", "gpu", "ffmpeg", "pynvvc"], default="auto",
+                    help="解码帧源（默认 auto）: gpu=ffmpeg NVDEC+GPU 转换直出 bgr24 "
+                         "rawvideo 到 stdout 管道、Python 内存流式读（与 ffmpeg 路径同一"
+                         "命令 bit-exact，不落 3GB raw，解码与下游检测重叠）；"
+                         "auto=gpu，失败（含中途断流）自动 WARNING 回退 ffmpeg 落盘路径"
+                         "重跑；pynvvc=PyNvVideoCodec(NVDEC) 硬解帧源（按源帧号 "
+                         "stride*k+delta 抽帧，仅 60/30fps 已标定、表外帧率自动回退管道；"
+                         "失败同样逐级回退 管道→落盘）；ffmpeg=现有 3GB raw 落盘路径"
+                         "（旧行为，一行未改）。--hw-decode 对 auto/gpu/ffmpeg 路径均生效")
+    ap.add_argument("--dedup", action="store_true",
+                    help="抽帧去重+段内选最佳帧(默认关): 连续相似帧分段, 段内选最清晰一张"
+                         "(避运动模糊)送检; 快速动作/scene cut 逐帧独立成段→不漏帧; "
+                         "rep 被闸门 drop 时按清晰度次序对 backup 帧补跑闸门取第一个 keep")
+    ap.add_argument("--dedup-cut-lo", type=float, default=2.0,
+                    help="dedup 低阈值(128px 灰度缩略图相邻帧平均绝对差): diff>=cut_lo 且"
+                         "段长>=min_seg 关段(滞回防闪烁)")
+    ap.add_argument("--dedup-cut-hi", type=float, default=10.0,
+                    help="dedup 高阈值: diff>=cut_hi 立即关段(快速动作/scene cut, "
+                         "逐帧独立成段不漏帧)")
+    ap.add_argument("--dedup-min-seg", type=int, default=2,
+                    help="dedup 最小段长(帧), 低于此长度 diff>=cut_lo 不关段(防闪烁)")
+    ap.add_argument("--dedup-max-seg", type=int, default=10,
+                    help="dedup 段最大帧数(10fps 下 10=1s 兜底: 全程无动作也每秒出 1 帧)")
+    ap.add_argument("--dedup-thumb", type=int, default=128,
+                    help="dedup diff 用的灰度缩略图长边(px)")
+    ap.add_argument("--dedup-sharp-side", type=int, default=256,
+                    help="dedup 清晰度(Laplacian 方差)用的灰度图长边(px)")
+    ap.add_argument("--dedup-backup", type=int, default=2,
+                    help="dedup 每段保留的次清晰 backup 帧数(rep 被 drop 时按清晰度次序补跑闸门)")
+    ap.add_argument("--dedup-max-mem", type=float, default=48.0,
+                    help="dedup 段内全分辨率帧内存上限(MB, 高分辨率按帧大小自适应压段长; "
+                         "1080p 默认 48 可容 ~8 帧, 4K 帧~24MB 只容 2 帧, 4K 想要真去重可调到 160)")
     ap.add_argument("--quality", type=int, default=90, help="JPG quality")
     ap.add_argument("--no-score-name", action="store_true",
                     help="disable the TEMPORARY score/angle naming (just stem_index.jpg)")
@@ -738,6 +1546,7 @@ def main():
                      pitch_max=(args.pitch_max or None),
                      pitch_min=(args.pitch_min or None),
                      ear_min=(args.ear_min or None),
+                     min_face_h=args.min_face_h,
                      gaze_max=(args.gaze_max or None),
                      gaze_dy_dev=(args.gaze_dy_dev or 0.0),
                      gaze_model=args.gaze_model,
@@ -746,7 +1555,18 @@ def main():
                      gaze_yaw_max=args.gaze_yaw_max,
                      head_on=(not args.no_head_gate),
                      head_conf=args.head_conf,
-                     head_model_path=args.head_model_path)
+                     head_model_path=args.head_model_path,
+                     dedup=args.dedup,
+                     dedup_cut_lo=args.dedup_cut_lo,
+                     dedup_cut_hi=args.dedup_cut_hi,
+                     dedup_min_seg=args.dedup_min_seg,
+                     dedup_max_seg=args.dedup_max_seg,
+                     dedup_thumb=args.dedup_thumb,
+                     dedup_sharp_side=args.dedup_sharp_side,
+                     dedup_backups=args.dedup_backup,
+                     dedup_max_mem=args.dedup_max_mem,
+                     hw_decode=args.hw_decode,
+                     decode_mode=args.decode)
     vf.run(targets, args.yaw, shared_csv=shared_csv)
 
 
