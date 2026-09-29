@@ -1,0 +1,185 @@
+(function () {
+  "use strict";
+
+  const platformOrder = ["windows", "woa", "linux", "jetson", "qnx"];
+
+  function isFilterScript(script) {
+    if (!script.src) {
+      return false;
+    }
+    try {
+      return new URL(script.src, window.location.href).pathname.endsWith("/cli-option-filter.js");
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function getScriptBaseUrl() {
+    const scripts = Array.from(document.getElementsByTagName("script"));
+    const current = scripts.find(isFilterScript);
+    return current ? new URL(".", current.src) : new URL("_static/", window.location.href);
+  }
+
+  function findTable(tableId) {
+    const exact = document.getElementById(tableId);
+    if (exact && exact.tagName.toLowerCase() === "table") {
+      return exact;
+    }
+    if (exact) {
+      const nested = exact.querySelector("table");
+      if (nested) {
+        return nested;
+      }
+    }
+    return null;
+  }
+
+  function createFilter(metadata, table, rows) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "cli-option-filter";
+    wrapper.dataset.cliFilterFor = metadata.tableId;
+
+    const control = document.createElement("div");
+    control.className = "cli-option-filter-control";
+
+    const label = document.createElement("label");
+    const selectId = `${metadata.tableId}-platform-filter`;
+    label.setAttribute("for", selectId);
+    label.textContent = "Platform";
+
+    const select = document.createElement("select");
+    select.id = selectId;
+
+    const allOption = document.createElement("option");
+    allOption.value = "all";
+    allOption.textContent = "All platforms";
+    select.appendChild(allOption);
+
+    platformOrder.forEach((key) => {
+      if (!metadata.platforms[key]) {
+        return;
+      }
+      const option = document.createElement("option");
+      option.value = key;
+      option.textContent = metadata.platforms[key];
+      select.appendChild(option);
+    });
+
+    const count = document.createElement("div");
+    count.className = "cli-option-filter-count";
+    count.setAttribute("aria-live", "polite");
+
+    const empty = document.createElement("div");
+    empty.className = "cli-option-filter-empty";
+    empty.textContent = "No options in this table are available for the selected platform.";
+
+    function update() {
+      const platform = select.value;
+      let visible = 0;
+      rows.forEach((row) => {
+        const platforms = row.dataset.cliPlatforms ? row.dataset.cliPlatforms.split(/\s+/) : [];
+        const show = platform === "all" || platforms.includes(platform);
+        row.hidden = !show;
+        if (show) {
+          visible += 1;
+        }
+      });
+      count.textContent = `Showing ${visible} of ${rows.length} options`;
+      empty.style.display = visible === 0 ? "block" : "none";
+    }
+
+    select.addEventListener("change", update);
+    control.appendChild(label);
+    control.appendChild(select);
+    wrapper.appendChild(control);
+    wrapper.appendChild(count);
+    wrapper.appendChild(empty);
+
+    const container = table.closest(".pst-scrollable-table-container") || table;
+    container.parentNode.insertBefore(wrapper, container);
+    update();
+  }
+
+  async function fetchJson(url) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        return null;
+      }
+      return await response.json();
+    } catch (error) {
+      console.warn("Unable to load CLI option filter metadata:", url.toString(), error);
+      return null;
+    }
+  }
+
+  async function installFilter(metadataUrl) {
+    const metadata = await fetchJson(metadataUrl);
+    if (!metadata) {
+      return;
+    }
+    if (!metadata.tableId || !Array.isArray(metadata.rows)) {
+      console.warn("Ignoring invalid CLI option filter metadata:", metadataUrl.toString());
+      return;
+    }
+    if (document.querySelector(`.cli-option-filter[data-cli-filter-for="${metadata.tableId}"]`)) {
+      return;
+    }
+    if (!metadata.platforms) {
+      metadata.platforms = {};
+    }
+    const table = findTable(metadata.tableId);
+    if (!table || !table.tBodies.length) {
+      return;
+    }
+    const bodyRows = Array.from(table.tBodies[0].rows);
+    if (metadata.rows.length !== bodyRows.length) {
+      console.warn(
+        "Ignoring CLI option filter metadata with row count mismatch:",
+        metadataUrl.toString(),
+        `metadata rows=${metadata.rows.length}`,
+        `table rows=${bodyRows.length}`
+      );
+      return;
+    }
+    metadata.rows.forEach((rowMetadata, index) => {
+      const row = bodyRows[index];
+      if (!row) {
+        return;
+      }
+      const platforms = Array.isArray(rowMetadata.platforms) ? rowMetadata.platforms : [];
+      row.dataset.cliOption = rowMetadata.option;
+      row.dataset.cliPlatforms = platforms.join(" ");
+      row.dataset.cliAvailability = rowMetadata.availability;
+    });
+    createFilter(metadata, table, bodyRows);
+  }
+
+  async function installFilters(files) {
+    const baseUrl = getScriptBaseUrl();
+    await Promise.all(
+      files.map((file) => {
+        if (typeof file !== "string" || file.includes("/") || !file.endsWith(".json")) {
+          return Promise.resolve();
+        }
+        return installFilter(new URL(`cli-option-availability/${file}`, baseUrl));
+      })
+    );
+  }
+
+  async function installAllFilters() {
+    const baseUrl = getScriptBaseUrl();
+    const manifestUrl = new URL("cli-option-availability/index.json", baseUrl);
+    const manifest = await fetchJson(manifestUrl);
+    if (!manifest || !Array.isArray(manifest.files)) {
+      return;
+    }
+    await installFilters(manifest.files);
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    installAllFilters().catch((error) => {
+      console.warn("Unable to install CLI option filter:", error);
+    });
+  });
+})();

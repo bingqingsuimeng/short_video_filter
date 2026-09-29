@@ -1,0 +1,55 @@
+/* Via: https://pydata-sphinx-theme.readthedocs.io/en/stable/user_guide/layout.html */
+
+/* Override the maximum width of the main content area */
+.bd-main .bd-content .bd-article-container {
+  max-width: 100%;  /* default is 60em */
+}
+
+.bd-page-width {
+  max-width: 130rem;  /* default is 88rem */
+}
+
+
+/* Override brightness/contrast adjustments in dark mode only */
+html[data-theme="dark"] .bd-article-container img {
+    filter: brightness(1.0) contrast(1.0) !important;
+
+}
+
+/* CLI option table platform filtering */
+.cli-option-filter {
+  align-items: center;
+  border: 1px solid var(--pst-color-border, #d8d8d8);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  margin: 0.75rem 0;
+  padding: 0.5rem 0.75rem;
+}
+
+.cli-option-filter-control {
+  align-items: center;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.cli-option-filter-control label {
+  font-weight: 600;
+  margin: 0;
+}
+
+.cli-option-filter-control select {
+  min-width: 14rem;
+  padding: 0.25rem 1.75rem 0.25rem 0.4rem;
+}
+
+.cli-option-filter-count {
+  color: var(--pst-color-text-muted, #555);
+  margin-left: auto;
+}
+
+.cli-option-filter-empty {
+  color: var(--pst-color-text-muted, #555);
+  display: none;
+  flex-basis: 100%;
+}
