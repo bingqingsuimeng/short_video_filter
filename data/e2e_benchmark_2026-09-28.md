@@ -619,3 +619,337 @@ FP16 引擎逐帧 `_trt_pass`;attention 判定阈值 = 管线实际值
    调深度只改一处。
 6. **批量 gaze 的 t_gaze 口径变化**:breakdown 中 gaze 现在按块内整次
    `estimate_batch` 计(含线程池预处理),与逐帧口径直接可比(同段同工作)。
+
+## 13. nsys 系统级 profiling(2026-09-29 第六轮,Nsight Systems 2026.5.1)
+
+### 13.0 结论摘要
+
+用 nsys 对现役配置(`--decode pynvvc-gpu --overlap auto`,e2e 9.9s/4 视频)做系统级
+剖析,四问四答(证据全部来自 recipe 输出表,见 13.2 工具链限制):
+
+| 问题 | 实测结论 |
+|---|---|
+| ① NVDEC 解码总时长 vs 2.13~2.28ms/帧估计 | **稳态解码节奏 1.68ms/源帧**(4K10bit,周期 8.42ms/5 帧:6.3+0.26+1.6+0.26ms),其中 pynvvc 的 SM 转换 0.31ms/帧,NVDEC ASIC ~1.37ms/帧;原估计偏保守,它混入了共享流串行拉伸与预热 |
+| ② SM 空闲构成 | SM 忙仅 **1.63s/9.9s(16.5%)**;空闲 ~8.3s = NVDEC ASIC 解码 ~4.3s + 共享流串行拉伸/lockstep ~2.6s + 会话预热 1.07s + 视频过渡/暴露尾 ~0.98s |
+| ③ producer/consumer 重叠率 | CPU 线程重叠良好(consumer 4.3s 大部分隐藏,pop 等待 5.1s 不变);但**设备侧单流串行**:消费端 SM 工作以 ~1:1 顶推解码窗口(099 +0.56s、154 +1.65s),真正的并行只发生在 NVDEC ASIC 与 SM 之间 |
+| ④ 剩余 >0.3s 可优化项 | 3 项:转换流分流 **0.8~1.5s**(中高风险)、宿主臂引擎懒加载 **0.3~0.4s**(低风险)、pinned slab 预分配 **~0.3s**(低风险);之后到墙(NVDEC ~4.3s + pynvvc 转换结构 1.0s) |
+
+对 §12.6 的复核:9.9s 的主体归因(producer-bound、NVDEC 地板)成立,但
+"NVDEC 纯解码 7.4~7.6s"**高估**——正确拆分为 NVDEC ~4.3s + pynvvc SM 转换
+~1.0s + 串行拉伸 ~2.6s(详见 13.8)。
+
+### 13.1 采集配置与开销(墙钟膨胀 0%)
+
+```
+nsys profile -t cuda,nvtx,nvvideo,python-gil --gpu-video-devices=0
+  --sample none --cpuctxsw none -o E:\output\nsys\bench4 -f true
+  E:\output\nsys\run_bench.bat E:\output\nsys\bench_vids
+  --out-dir E:\output\nsys\nsys_run --decode pynvvc-gpu
+```
+
+- Windows 无 osrt 采样(非 admin),故 `--sample none --cpuctxsw none`;
+  `--gpu-video-devices=0` 开视频引擎采集(但见 13.2 限制③)。
+- 4 视频硬链接到 `E:\output\nsys\bench_vids\`(不动原文件);app 输出经
+  ASCII-only `run_bench.bat` 重定向到 `app_nsys.log`。
+- **开销对照**:app 内部计时 nsys 下 9.9s == 无剖析基线 ×3 次(9.9s)→ 测量
+  窗口内膨胀 0%;nsys 会话墙钟 14.2s vs 裸跑 10.85s(差值 = 注入 + 报告
+  生成,在 app 计时之外)。
+- **输出等价**:4 份 pose_report CSV + 257 张 JPG 与基线逐字节一致;单视频
+  154 冒烟(194 帧)逐位一致。GPU 全程单进程(utilization 表仅 PID 9652)。
+
+### 13.2 工具链障碍与绕行(三个,全部记录在案)
+
+1. **中文 locale 的 nsys 元数据 GBK bug**(产品 bug):报告内
+   META_DATA_EXPORT.parquet 时区名是 GBK 字节("中国标准时间"),所有走
+   duckdb 的 skill 命令(report-fact / report-query / report-context)在真实
+   报告上全部失败;TZ=UTC、--discard-environment=true 均无效。
+   **绕行**:分析全部改走 recipe 引擎(原生加载器容忍 GBK),报告副本须放
+   C 盘(跨盘 alias 报 WinError 17)。副作用:NVDEC 引擎表/video 事实无法经
+   report-fact 读取。
+2. **nsys 注入使子进程 stdout 静默变空**:ffprobe exit 0 但输出空(文件重
+   定向同样空,-t none 也一样)。**绕行**:probe() 加 SVF_PROBE_CACHE
+   门控缓存分支(不设变量时该分支不存在,默认行为逐字节不变;缓存由同机
+   真实 probe() 预生成,数值与 §1 一致);此改动在 filter_video.py 工作区
+   **未提交**,冒烟 194 帧逐位一致。
+3. **无 NVTX runtime DLL**(机器上搜索无结果)→ 未加 NVTX(按任务书"仅在
+   必要时"),改用 **kernel 名归因**(自研 kernel 名 + pynvvc 固有
+   转换 kernel 名 + TRT 内核),语义等价且零代码侵入。
+
+另:recipe 位置参数必须放 `--` 之后且只接受 live help 里的选项(无
+--rows);--filter-time 格式为 start/end 整数 ns;recipe 输出每表上限
+100 行(pace 类需配合 count/窗口切分交叉验证)。
+
+### 13.3 GPU 全景:SM/CE 忙闲(证据:cuda_gpu_kern_sum / cuda_gpu_mem_time_sum / gpu_time_util --chunks 200)
+
+设备忙合计 ~2.37s / 9.9s(24%):
+
+| 类别 | 时长 | 明细 |
+|---|---|---|
+| SM kernels | **1.63s (16.5%)** | pynvvc 转换 **0.99s(61%)** = ConvertP016BLtoP016 3171×155.6µs + YuvToRgbKernel 3171×157.9µs;自研 kernel 0.185s(area_fast_u8 31×39.4ms、rgb2bgr_inplace_u8 508×95.4ms、head_letterbox_u8 268×22.5ms、letterbox_bgr2rgb 41×12.1ms、area_generic_u8 10×15.5ms);TRT 引擎+preproc ~0.45s(permutationKernelPLC3 626×107ms ≈ 625 判定帧各一次等) |
+| CE D2D | 96.9ms / 634 次 | = §10.2 拷贝1(625 选中帧 + 9 溢出),14.66GB 对上 |
+| CE D2H | 538.1ms / 1637 次 | 508 全帧落地 ≈ 534ms(12.57GB ≈ 508×24.8MB 对上)+ 1129 次小输出拷贝 |
+| CE H2D | 89.0ms / 6705 次 | pose/gaze 小块 + 引擎权重(max 114ms) |
+| memset | 11.1ms / 848 次 | |
+
+200-chunk 利用率图:解码窗口内 SM duty 仅 10~25%;全程无 >0.2s 的设备全空
+段(32-chunk 粗图上的 1.7s"空洞"是低占空比 chunk 被阈值合并的假象)。
+
+### 13.4 NVDEC 解码节奏实测(问题①;证据:cuda_gpu_kern_pace --name YuvToRgbKernel,全 session + 5 个 filter-time 窗口)
+
+YuvToRgbKernel 恰好 3171 次 = 源帧总数:pynvvc 每解一源帧跑一对
+ConvertP016BLtoP016(P016→中间格式)+ YuvToRgb(→RGB),逐 launch 间隔即
+解码输出节奏:
+
+| 视频 | 分辨率/帧率 | 稳态节奏 | 转换窗口(trace 时轴) | 窗口/帧 |
+|---|---|---|---|---|
+| 006 | 4K60 | **1.68ms/帧**(周期 8.42ms/5 帧) | 1.956→~3.06s(1.10s) | 1.74ms |
+| 099 | 4K60 | 2.23ms/帧(消费端已活跃) | ~3.14→~5.54s(2.40s) | 2.38ms |
+| 154 | 4K30 | 3.2~3.9ms/帧,max stall 61ms | 5.606→8.237s(2.63s) | 4.51ms |
+| 214 | 1900×3378@60 | 1.57~1.66ms/帧 | 8.98→10.76s(1.78s) | 1.88ms |
+
+- 每帧稳态结构:NVDEC ASIC ~1.37ms + ConvertP016 0.156ms + YuvToRgb
+  0.166ms = 1.68ms;006 与 214 节奏几乎相同 → 该档分辨率下解码节奏不受
+  像素量影响(NVDEC 管线节拍主导)。
+- 006(消费端几乎无工作,gaze/head 均 0)给出**无干扰地板 1.68ms/帧**;
+  099/154 的劣化与消费端负载强相关(见 13.5),不是源帧率差异。
+- 154 的窗口 2.63s 比地板(583×1.68=0.98s)多 1.65s —— §12.6 的"154 之谜"
+  在此定位(13.5/13.8)。
+
+### 13.5 producer/consumer 重叠质量(问题③)
+
+- CPU 侧:producer 等待(decode= 合计 9.25s)覆盖 9.9s 墙钟的绝大部分,
+  consumer 的 host 链(detect/judge/gaze/head/imwrite 合计 4.3s)大部分
+  隐藏其内 —— 与 §12.6 pop 等待 5.10s 的 producer-bound 结论一致。
+- **设备侧是单流串行**(解码器与自研臂共用一条 pycuda 流,§10.5 保序设
+  计):pynvvc 的逐帧转换 kernel 与消费端全部 SM kernel(SCRFD/pose/gaze/
+  head/自研 kernel)在同一条流上互斥执行。消费负载与解码窗口拉伸:
+
+| 视频 | 消费端 gaze+head+detect(host) | 窗口/帧 vs 地板 1.68ms | 拉伸 |
+|---|---|---|---|
+| 006 | ~0.1s(kept 0) | 1.74ms | ~0 |
+| 099 | 0.64s | 2.38ms | +0.56s |
+| 154 | 1.38s | 4.51ms | +1.65s |
+| 214 | 0.47s | 1.88ms | +0.13s |
+
+  方向单调一致(量级受 kept 数/JPG/D2H 影响有噪声)。**"重叠"的真实机
+  制 = NVDEC ASIC 与 SM 并行;SM 内部的解码路径与推理路径是串行的,消费
+  端每 ~1s SM/host 工作换取解码窗口 ~1s 拉伸。**这正是 §12.6 观察到的
+  "gaze 批量 −0.86s 只兑现 −0.4~−0.5s"的机理:省下的消费时间一部分被解
+  码窗口回吐。
+
+### 13.6 CPU 侧开销(证据:cuda_api_sum / cuda_api_sync;多线程聚合值,不与墙钟直加)
+
+| API | 次数 | 总 CPU 时 | 注 |
+|---|---|---|---|
+| cuLaunchKernelEx + cuLaunchKernel | 18181+6462 | **2.48s** | 中位数仅 4~9µs,重尾(max 9/119ms)→ 双线程驱动锁争用痕迹,总量大但非单项可治理 |
+| **cudaMemcpyToSymbol** | **6342 = 2×3171** | **2.16s** | pynvvc 逐帧转换路径自带,每源帧 2 次(中位 125µs,max 99ms)—— 解码路径 CPU 税,见 13.7-D |
+| cuMemcpyDtoHAsync_v2 | 1543 | 1.37s | 中位 6.8µs,max 121ms(重尾个别点) |
+| cuStreamSynchronize | 210 | 575ms | 单次 max 72.6ms;§11.2 的同步点符合 |
+| cuMemHostAlloc / cuMemFreeHost | 4 / n | **381ms**+141ms | pinned land slab 按分辨率重建(4K 套×2 + 214 分辨率套×2) |
+| cuEventSynchronize/Record 等 | — | <60ms | 可忽略 |
+
+单次同步 max 0.71ms(cuda_api_sync)确认无隐藏大同步。
+
+### 13.7 优化机会清单(问题④)
+
+| # | 现象 | 证据 | 预计节省 | 风险 | 触碰 625 帧逐位一致门槛? |
+|---|---|---|---|---|---|
+| A | 解码转换 kernel 与推理 kernel 同流串行,解码窗口被消费负载拉伸 | 13.5 表(154 +1.65s/099 +0.56s);窗口内 SM duty 仅 10~25% 有并发余量 | **0.8~1.5s** | 中高:转换分流到独立流需逐帧/逐块 event 保序(D2D 必须等该帧转换完成),竞态写错像素是最坏路径 | 可验证:配方一致时输出应逐位不变;必须过 625 帧硬门槛 + 4K 复测 |
+| B | 宿主臂 SCRFD/head 引擎双加载:__init__ 急加载(filter_video.py:587/643)+ _ensure_gpu_arm 再建同文件独立实例(:1523/1527) | app 日志 SCRFD/head 各出现两次 engine loaded;预热窗口 0.889→1.956s(1.07s,util 5.4%) | **0.3~0.4s/会话** | 低:宿主臂实例改懒建(回退路径首次用时再建),GPU 臂行为不变 | 无影响(判定逻辑与引擎实例无关) |
+| C | pinned land slab 按分辨率重建(4 次 381ms + 释放 141ms) | cuda_api_sum cuMemHostAlloc 4 次 381ms;OVL_SETS=2 × 两档分辨率 | **~0.3s** | 低:按最大分辨率预分配(内存峰值反而更低);需 OVL 槽位几何参数化 | 无影响(纯内存管理) |
+| D | pynvvc P016→RGB 结构成本:0.99s SM + 2.16s CPU(13.3/13.6) | kernel/api 表 | 仅改像素管线(NV12/P010 直读 + 自研融合 kernel)才可动,上限 ~1.0s | 极高(§11 已否决同路线) | 会 —— 像素数学改变,本轮不做 |
+| E | launch API 聚合 2.48s 的重尾(双线程驱动锁) | cuda_api_sum 中位数 vs max | 无单独治理手段(减 kernel 数/合并已做过) | — | — |
+
+A+B+C 全兑现的期望墙钟 ≈ **7.8~8.5s**;再往下 = NVDEC ASIC ~4.3s +
+pynvvc 转换 1.0s + 消费端真实工作,系统级到墙。
+
+### 13.8 对 §12.6 归因的复核结论
+
+§12.6 的框架(producer-bound、consumer 大部分隐藏、预热单列)被 nsys 证实,
+两处量化修正:
+
+1. "NVDEC 纯解码 7.4~7.6s"高估。实测拆分:NVDEC ASIC ~4.3s(3171×1.37ms)
+   + pynvvc SM 转换 ~1.0s + 共享流串行拉伸 ~2.6s(154/099 为主)+ 预热
+   1.07s + 过渡/暴露尾 ~0.98s ≈ 9.9s(闭合,±0.2s)。原 2.13~2.28ms/帧是
+   "稳态节奏+拉伸+预热"的混合均值,纯地板是 1.68ms/帧(含转换)。
+2. "154 的 +0.55s 疑与批量 gaze 负载相关"证实并放大:154 解码窗口比地板
+   多 1.65s,与消费端 1.38s 的 SM/host 负载同源(单流串行顶推);gaze 批
+   量化在 154 上净赚 −0.33s 的同时确实拉长了 producer 窗口。若做 13.7-A
+   分流,154 是最大受益者。
+
+### 13.9 本轮新增工程注意点
+
+1. **中文 locale 上 nsys 的 duckdb 路径不可用**(GBK 时区名 bug),分析一律
+   走 recipe;报告与 skill 工作区必须同盘(C 盘),否则 WinError 17。
+2. **nsys 注入会阉割子进程 stdout**(含文件重定向),任何依赖 ffprobe 的
+   剖析跑法都要预生成元数据缓存;SVF_PROBE_CACHE 门控分支未提交,留
+   用户决定去留。
+3. recipe 参数必须放 `--` 后、以 live help 为准;--filter-time 用整数
+   start/end(ns);pace 输出每表 100 行上限,长序列用窗口切分 + count
+   交叉验证。
+4. .bat 包装脚本必须 ASCII-only(GBK 命令报错文本会被收进报告
+   StringIds,污染所有 parquet 读取)。
+5. YuvToRgbKernel/ConvertP016BLtoP016 的次数 = 源帧数、permutationKernelPLC3
+   次数 ≈ 判定帧数 —— 后续 nsys 分析可直接用这三类 kernel 名做免 NVTX 的
+   阶段归因。
+6. 本轮产物:E:\output\nsys\(bench4.nsys-rep、采集/配方脚本、
+   _recipe_tables.txt、_pace_tables.txt、_gpuu200.txt、app_nsys.log);
+   判定逻辑/阈值/旧臂零改动;未删除任何 mp4;未提交 commit。
+
+---
+
+## 14. D 轮:流分流与死重清除(2026-09-29)
+
+目标:兑现 §13.7 的 A/B/C 三项。执行顺序 B→C→A;结论先行——**B/C 按预期兑现,
+A 机制成立但 §13.5 的收益归因被本轮 trace 证伪(收益≈0)**,r1 口径 e2e
+10.05s → 9.70s(同机同会话交替计时,1.036x)。未达 §13.7 期望的 ~8.0-8.5s,
+缺口正是 A 项被高估的部分,详见 §14.2/§14.3。
+
+### 14.1 改动清单(全部未提交)
+
+| 项 | 位置 | 内容 |
+|---|---|---|
+| B | filter_video.py `__init__`(SCRFD 块 / head 块 / 收尾块) | 宿主 SCRFD/head 改 property 懒加载(det :719-728, head :731-754);非 pynvvc-gpu 臂(含 --dedup)在 `__init__` 立即物化(旧行为逐字节同);pynvvc-gpu 臂保持懒建 |
+| B | filter_video.py `_ensure_gpu_arm` :1584-1610 | device head 只看 `self._head_on/_head_conf`,不触碰 `self.head`(避免触发宿主无谓构建);device head 构建失败 → WARNING + 闸门全局关闭(与旧宿主失败同语义) |
+| B | filter_video.py `_run_pass_gpu` B/C 段 | `self.head is not None` → `g["head"] is not None`(GPU 臂不再触发懒构建;判定语义等价) |
+| C | filter_video.py `__init__` 收尾 :697-715 | pinned land slab 一次性预分配:2×(chunk+8)×4K(3840×2160×3)≈3.57GB,仅 `pynvvc-gpu 且非 dedup 且 overlap≠off` 时 |
+| C | filter_video.py `_run_pass_gpu` :1666-1692 | slab 获取改三级:已有够大 slab(跨视频复用 grow-only,原语义)→ 吃 `__init__` 预分配 → 原地按需分配;失败 → None → 原可分页逐帧回退路径 |
+| A | src/gpu_decode.py `_PynvvcGpuSource` :242-257, :276-281, :336-350 | 新参 `dstream=None`(None→退化为旧单流);解码器(Threaded/Simple)建在 dstream 上;逐帧 D2D 改走 dstream;`read_block` 末尾出口事件护栏:`ev_d.record(dstream)` + `stream.wait_for_event(ev_d)` |
+| A | src/gpu_decode.py `_OverlappedGpuSource` :430-446 | `dstream` 透传内层源(producer 线程不变:ctx.push + 解码 + D2D) |
+| A | filter_video.py `_ensure_gpu_arm` :1598-1602, `_run_pass_gpu` :1712/:1721 | `g["dstream"] = Stream()` 一次创建跨视频复用;两臂构造处传入 |
+
+### 14.2 实测收益 vs §13.7 估计(诚实口径)
+
+| 项 | §13.7 估计 | 实测(r1 口径) | 差异解释 |
+|---|---|---|---|
+| B 宿主臂引擎懒加载 | 0.3~0.4s | **r1 口径 ≈0**(宿主引擎加载本就在 run() 墙钟之外);进程 wall −0.30~0.35s(成功走 GPU 臂时 6→4 次引擎加载,host SCRFD/head 全程不建) | 与 §13.7-B 的"预热窗口"口径一致:收益在预热段,不在 e2e 指标 |
+| C pinned slab 预分配 | ~0.3s | **r1 口径 −0.35~0.39s**;进程 wall ±0(成本一次性付在 `__init__`) | 两阶段:先做后台线程版,实测 ≈0 收益——cuMemHostAlloc 走驱动全局锁,与 CUDA 宿主 API 天然串行(探针 `_test/post6_pinned_stall_probe.py`:后台分配 1.7GB 期间主线程 4MB 小分配最大停顿 245ms),无法与解码会话建立真并行;改 `__init__` 预分配(r1 口径"预热单列"段)后兑现 |
+| A 解码转换流分流 | **0.8~1.5s** | **≈0**(噪声内) | §13.5 归因证伪,见 §14.3 |
+
+**e2e(4 视频,r1 口径,同机同会话交替)**:old(§13 代码快照)10.1/10.0/10.1/10.0
+→ mean **10.05s**;new(B+C+A)9.7/9.7/9.7 → mean **9.70s**;**1.036x**。
+进程 wall:old mean 11.02s → new mean 10.86s(−0.16s:B 的加载节省被 C 的
+init 预分配抵消大半——两笔成本都真实存在,只是位置移动)。
+按 §13 机器标定(9.90s 基线)折算:本轮等效 ≈9.55s。系列:16.30 → 13.42 →
+10.30 → 9.90 → **9.90 基线机器 ≈9.55**(今日漂移机器实测 9.70),累计 1.71x。
+**未达 ≤8.6s 目标**——缺口即 §13.7-A 被证伪的部分(§14.3/§14.6)。
+
+### 14.3 A 项:机制成立、归因证伪(本轮最重要的一手结论)
+
+**机制(已 trace 级验证)**:新旧 trace 各采一轮 4 视频(`_test/post6_nsys_streams.py`
+/`post6_nsys_compare.py` + post6_a.nsys-rep/bench4.sqlite):
+- old:YuvToRgbKernel/ConvertP016BLtoP016 3171 次全部在主流(stream 74)与消费 kernel 同流;
+- new:3171 次全部移到独立 dstream(stream 22),消费 kernel(TRT sm80/sm75_xmma、
+  自研 area/letterbox/swap)在主流(stream 20),pose/gaze 引擎仍各在自流(16/21)。
+
+**但解码窗口未变**(按视频分段,转换 kernel 逐帧窗口/间隔分布新旧同量级):
+
+| 段(=视频) | n | old 窗口/帧 | new 窗口/帧 | old gap_p90 | new gap_p90 |
+|---|---|---|---|---|---|
+| 006+099 | 1641 | 2.52ms | 2.47ms | 5.8ms | 5.9ms |
+| 154 | 583 | 3.61ms | 3.67ms | 6.6ms | 6.5ms |
+| 214 | 947 | 2.03ms | 2.03ms | 4.9ms | 4.8ms |
+
+且新旧 trace 中转换 kernel 与消费 kernel 的**时间重叠都是 0.00s**——SM 上根本
+不存在"被消费 kernel 顶推"的碰撞:重叠臂是 producer-bound,消费端 GPU 段每块
+只占几十 ms 且紧跟 sync,与解码窗口几乎不相交。**§13.5"同流 SM 串行拉伸解码
+窗口"归因不成立**,§13.5 表格中"拉伸 ∝ 消费负载"的真实耦合是:
+1. **消费端 host 链**闸住 token 释放(gaze/head/imwrite 的 host 时间)——重叠臂
+   producer 最多领先 1 块,消费块 host 时间 > 解码块时间时窗口被拉长(154:
+   gaze+head+imwrite ≈2.9s ÷ 10 块 ≈ 290ms/块,远大于解码 108ms/块);
+2. **解码线程自身逐帧 CPU 税**(§13.6 cudaMemcpyToSymbol 2 次/帧 0.68ms +
+   launch/sync)——与 §13.7-D 同源,像素管线不动就不可治(§11 已否决)。
+
+**结论:A 保留(机制正确、零回归、为未来消费端 GPU 负载加重的场景留了余量),
+但 §13.7-A 的 0.8~1.5s 从"待兑现"改判为"不存在";到墙的最后一块石头是
+§13.7-D(解码线程 CPU 税)与消费 host 链,均在本轮否决/已优化过的范围内。**
+
+### 14.4 A 项保序证明(两流后的 happens-before)
+
+数据流(新):
+
+```
+[producer 线程]                          [主流 = 消费]
+  NVDEC 硬解(YUV, ASIC)                    scrfd_block_detect: area→letterbox→TRT
+  ConvertP016/YuvToRgb (dstream)            landing: swap→D2H(主流)→sync
+  D2D 入池 (dstream)                        head letterbox→TRT→sync
+  ev_d.record(dstream)                      …全部读槽 kernel…
+  stream.wait_for_event(ev_d)  ──────────→ 块 j 的消费 kernel(排在 wait 后)
+  q_put(块 j)  ───(queue happens-before)──→ pop(j) → 释放块 j-1 token
+```
+
+不变式(对每块 j):
+1. **D2D(j) 完成 → 消费读帧**:`read_block` 末尾 `ev_d.record(dstream)` 后
+   `stream.wait_for_event(ev_d)` 在 `q_put(j)` **之前**入队(producer 程序序);
+   consumer 块 j 的 kernel 只能在 pop(j) 之后入队(queue happens-before),在
+   主流上恒排在该 wait 之后,执行晚于 D2D(j) 完成。覆盖 no_face 块(area 仍
+   读槽)与 EOF 块(guard 照入队,零 D2D 时空等)。
+2. **消费读帧(块 j-2)→ D2D(j) 覆写同组槽**:token 协议(OVL_SETS=2)+ 块内
+   同步链(scrfd `_trt_pass`、landing D2H、head `stream.synchronize()`)使得
+   pop(j-1) 释放块 j-2 的 token 时,块 j-2 全部读槽 kernel 已**设备侧完成**
+   (host sync);producer 解码第 j 块(至少 NVDEC 一帧延迟)远在其后。与旧单流
+   设计同一论证,事件只加不减。**不加入口护栏**是有意的:入口 guard 会令
+   D2D(j) 等待块 j-1(异组,无冲突)的 kernel,破坏重叠。
+3. **解码器内部帧缓冲回收**:写它的转换 kernel 与读它的 D2D 同在 dstream,
+   同流程序序保护(§10.5 enqueue-order 余量论证原样成立)。
+4. **事件复用**:CUDA wait 捕获"wait 调用时刻最近一次 record";producer 单线程
+   record→wait 程序序保证本块 wait 恒绑定本块 record,跨块 re-record 不影响
+   已入队 wait(探针 `_test/post6_event_probe.py`/`post6_event_probe2.py`:
+   pycuda 2026.1 Event/record/wait_for_event 可用且跨流 wait 生效)。
+5. **无死锁**:全部等待在设备侧,无新增 host 阻塞;两流 wait 依赖链
+   (dstream→main→dstream)按块交替、每段只覆盖此前已入队工作,无环。
+
+串行臂(--overlap off)同路径受益同保护:单线程 read_block,出口 guard 与旧
+同流程序序语义等价;`_run_pass` 宿主臂/管道臂/落盘臂不触碰 gpu_decode 模块
+(懒导入),零影响(实测 §14.5 #6/#7)。
+
+### 14.5 等价性与稳定性总表(全部 PASS)
+
+| # | 验证 | 对照 | 结果 |
+|---|---|---|---|
+| 1 | GPU 臂(final)r1 | base_run_r1(§13 基线) | CSV 625/625 逐位一致,JPG 257 md5 逐字节一致 |
+| 2 | GPU 臂 r2(复现) | base_run_r1 | 同上 |
+| 3 | --overlap off(final) | base_off_r1 | 同上 |
+| 4 | 回退链(注入 GPU 臂初始化失败→宿主 pynvvc) | base_run_r1 | 同上;且懒加载断言:run 前 `_det_obj is None`/head pending,run 后 det 已建、head ok(`_test/post6_fallback_check.py`) |
+| 5 | 宿主 pynvvc 臂(--decode pynvvc) | base_run_r1 | 同上(§10.3 双臂逐位同再证) |
+| 6 | ffmpeg 管道臂 new vs old 快照 | 同臂互证 | CSV 625/625,JPG 260 逐字节一致 |
+| 7 | --dedup new vs old 快照 | 同臂互证 | CSV 542/542,JPG 187 逐字节一致 |
+| 8 | 100 帧反复起停 ×10(串行)+ ×3(重叠臂) | — | 无死锁/无泄漏/帧数一致(`_test/post6_startstop_smoke.py`) |
+| 9 | 强杀泄漏检查:硬杀 ×2(7s 中途/12s)+CTRL_BREAK ×1 | nvidia-smi | 三次均无 python 残留显存(`_test/post6_kill_leak_check.py`) |
+| 10 | B 懒加载断言 | — | 见 #4;引擎加载日志 6→4 |
+
+注:早期 B 轮回退冒烟曾报 154 上 14 行 keep→gaze 不一致——为测试脚本直构
+VideoFilter 未传 `gaze_yaw_max`(argparse 默认 20.0,`__init__` 默认 15.0),
+15<|yaw|≤20 帧误判;对齐参数后 PASS。**非代码缺陷**,已在脚本内注释。
+
+### 14.6 对 §13.6/§13.7 的两处归因修正
+
+1. **"cuMemHostAlloc 4 次 381ms = pinned slab 按分辨率重建"不准确**:land
+   slab 本就是 grow-only 跨视频复用(`len(land_slabs[_si]) < land_cap` 判定),
+   4 次分配 = 首视频 006 的 2 块 land slab + gaze `_pipe_slabs` 2 块(约 98MB×2,
+   小头);不存在"4K 套×2 + 214 分辨率套×2"的重建。C 项的收益来源是"首视频
+   0.39s 移出 r1 口径"而非"消除重建"。
+2. **§13.5 同流串行拉伸 → 改判**(§14.3):拉伸 = 消费 host 链闸 token + 解码
+   线程 CPU 税;SM 流串行贡献 ≈0。§13.7-A 的 0.8~1.5s 不存在,§13.8 的
+   "9.9s 闭合拆分"中"共享流串行拉伸 ~2.6s"一项应并入"解码线程 CPU 税 +
+   消费 host 链暴露"。到墙判定不变但构成修正:**NVDEC ASIC ~4.3s + 解码线程
+   CPU 税(§13.7-D,已否决路线)+ 消费端真实工作(host 链为主)+ 预热**,GPU
+   侧调度已无余量可挖——GPU 臂到墙的判定由"NVDEC+SM 串行"修正为
+   "NVDEC+解码线程串行+消费 host 链"。
+
+### 14.7 本轮产物与工程注意点
+
+- 脚本(`_test/`,前缀 post6_):event_probe / event_probe2(pycuda Event API
+  探针)、pinned_thread_probe / pinned_stall_probe(分配争用探针)、
+  equiv.py(比对器)、fallback_check.py(回退链)、startstop_smoke.py、
+  kill_leak_check.py、nsys_streams.py / nsys_compare.py(trace 分析)。
+- 产物:E:\output\_gpudecode\post6\(old_snapshot_src 旧代码快照+models
+  junction、全部对照运行与日志)、E:\output\nsys\(post6_a.nsys-rep/
+  post6_a.sqlite/bench4.sqlite 及采集脚本 post6_capture_a.sh)。
+- 注意点:1) pycuda `pagelocked_empty` 非主线程调用必须 `ctx.push()`(探针2
+  同款),线程退出时 pycuda 打 "could not be cleaned up" 警告为 GC 清理提示,
+  持引用内存有效;2) cuMemHostAlloc 与一切 CUDA 宿主 API 经驱动全局锁串行,
+  "后台线程分配 pinned 内存"是伪并行;3) 测试脚本直构 VideoFilter 必须显式传
+  `gaze_yaw_max=20.0`(argparse 默认与 `__init__` 默认不同);4) nsys 采集沿用
+  §13.9 的 SVF_PROBE_CACHE + ASCII bat 包装配方,本轮零改动复用。
+- 判定逻辑/阈值零改动;未删除任何 mp4;未跑 225 全量;未提交 commit。

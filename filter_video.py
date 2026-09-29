@@ -115,6 +115,20 @@ def probe(path):
     verbose 进度显示与日志（w/h/fps 才参与解码命令与循环 shape），元数据缺失/
     解析异常时才回退 -count_frames 精确数一遍（慢但准）。
     """
+    # post6 nsys profiling 兼容: nsys 注入会使子进程(ffprobe)的 stdout 静默变空
+    # (实测 exit 0 且文件重定向同样为空), 令元数据探测失败。设 SVF_PROBE_CACHE
+    # 时改读预生成的缓存 JSON(键=abs path, 值=[w,h,fps,nframes]; 缓存由同机
+    # 无 profiling 的真实 probe() 生成, 数值与实跑一致)。不设该变量时此分支
+    # 完全不存在, 默认行为逐字节不变。
+    _pc = os.environ.get("SVF_PROBE_CACHE")
+    if _pc:
+        try:
+            with open(_pc, "r", encoding="utf-8") as _pf:
+                _hit = json.load(_pf).get(os.path.abspath(path))
+            if _hit:
+                return int(_hit[0]), int(_hit[1]), float(_hit[2]), int(_hit[3])
+        except Exception:
+            pass                      # 缓存缺失/损坏 → 落回真实 ffprobe
     cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
            "-show_entries",
            "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,duration",
@@ -570,7 +584,15 @@ class VideoFilter:
                  hw_decode=True, decode_mode="auto",
                  pipeline=True, pipeline_depth=16, head_batch=True,
                  head_letterbox_workers=8, overlap="auto"):
-        self.det = SCRFDTRTDetector(engine, max_batch=batch, conf_thres=conf)
+        # D 轮懒加载(§14): 宿主 SCRFD 实例不再在 __init__ 急建 —— pynvvc-gpu 臂
+        # 下 _ensure_gpu_arm 会对同一引擎文件另建 device 实例, 宿主实例是纯死重
+        # (§13.7-B: 日志两次 "engine loaded")。__init__ 只存配置, 首次访问时
+        # 构建(det property); 非 GPU 臂在 __init__ 末尾立即物化(见下), 计时口径
+        # 与旧行为一致(引擎加载在逐视频墙钟之外, r1 口径照旧单列)。
+        self._det_engine = engine
+        self._det_batch = batch
+        self._det_conf = conf
+        self._det_obj = None
         # 68 点 3D 姿态模型（可靠角度）；引擎缺失则回退 SCRFD 5 点 solvePnP
         self.pose68 = None
         if pose_engine and os.path.exists(pose_engine):
@@ -623,14 +645,13 @@ class VideoFilter:
                 print(f"[filter] !! 眼神闸门加载失败，Stage2 关闭: {e}")
         # Stage1.5 人头闸门：其它闸门全过且单人脸的帧，跑 head2 人头检测，
         # NMS 后 head 总数 >= 2（含主角的头）→ 判 multi_head 丢弃
-        self.head = None
-        if head_on:
-            try:
-                from src.head_gate import HeadGate
-                self.head = HeadGate(head_model_path, conf_thresh=head_conf)
-                print(f"[filter] 人头闸门 = head2 (TensorRT) conf={head_conf}")
-            except Exception as e:
-                print(f"[filter] !! 人头闸门(head2)加载失败，人头闸门关闭: {e}")
+        # D 轮懒加载(§14): 同 SCRFD, 宿主实例改 head property 懒建。加载失败
+        # 的语义与旧版一致: 打印 WARNING 后闸门全局关闭(head 恒为 None, 不回退)。
+        self._head_on = head_on
+        self._head_conf = head_conf
+        self._head_model_path = head_model_path
+        self._head_obj = None
+        self._head_state = "pending"   # pending → ok / failed / off
         # 抽帧去重 + 段内选最佳帧（--dedup 开启时生效，默认关，行为与旧版一致）
         self.dedup = dedup
         self.dedup_cut_lo = dedup_cut_lo
@@ -663,6 +684,73 @@ class VideoFilter:
         self.engine_path = engine                  # SCRFD 原引擎文件（device 臂同引擎另建实例）
         self._head_engine_path = head_model_path   # head 引擎路径（None → 默认解析）
         self._gpu = None
+        # D 轮懒加载(§14)收尾: 非 pynvvc-gpu 臂(含 --dedup——其显式回退宿主臂)
+        # 在 __init__ 内立即物化宿主 SCRFD/head 实例, 与旧行为逐字节同(引擎
+        # 加载在 run() 墙钟之外, r1 口径照旧单列); pynvvc-gpu 臂保持懒建 ——
+        # GPU 臂初始化失败回退宿主臂时首次访问 det/head 再建(回退链无损)。
+        if decode_mode != "pynvvc-gpu" or dedup:
+            _ = self.det
+            if head_on:
+                _ = self.head
+        # D 轮 C 项: 落地 pinned slab 一次性预分配(4K UHD 容量 ×OVL_SETS,
+        # 仅 pynvvc-gpu 臂 + 重叠开启时)。放在 __init__(r1 口径的"预热单列"
+        # 段, 与引擎加载同级, run() 墙钟之外): cuMemHostAlloc 走驱动全局锁,
+        # 与后续一切 CUDA 宿主 API 串行(探针 _test/post6_pinned_stall_probe.py:
+        # 后台线程分配 1.7GB 期间, 主线程 4MB 小分配最大停顿 245ms) ——
+        # 后台线程方案无法与解码会话建立真并行, 一次付清最干净。首视频起
+        # 零分配; 超 4K 容量的视频仍走 _run_pass_gpu 内按需扩容路径(逐字节
+        # 同旧行为); 分配失败(内存不足) → None → 可分页逐帧回退路径。
+        self._land_slabs_pre = None
+        if decode_mode == "pynvvc-gpu" and not dedup and overlap != "off":
+            try:
+                from src.gpu_decode import OVL_SETS as _ov
+                import pycuda.driver as _d
+                _cap4k = (self.detect_chunk + 8) * 3840 * 2160 * 3
+                self._land_slabs_pre = [
+                    _d.pagelocked_empty((_cap4k,), np.uint8)
+                    for _ in range(_ov)]
+            except Exception as _e:
+                print(f"[filter] pinned slab 预分配失败, 回退按需分配: {_e}")
+                self._land_slabs_pre = None
+
+    # ---- 宿主臂引擎懒加载 property(D 轮, §14) ----
+    # 语义保持: 加载失败 → 打印一次 WARNING 后闸门关闭(head 恒 None, 不抛出);
+    # SCRFD 失败仍向上抛(与旧 __init__ 一致 —— 旧版在构造处直接失败)。
+    @property
+    def det(self) -> SCRFDTRTDetector:
+        if self._det_obj is None:
+            self._det_obj = SCRFDTRTDetector(
+                self._det_engine, max_batch=self._det_batch,
+                conf_thres=self._det_conf)
+        return self._det_obj
+
+    @det.setter
+    def det(self, v) -> None:
+        self._det_obj = v          # 允许外部注入/覆盖(测试兼容)
+
+    @property
+    def head(self):
+        if self._head_state == "pending":
+            if self._head_on:
+                try:
+                    from src.head_gate import HeadGate
+                    self._head_obj = HeadGate(self._head_model_path,
+                                              conf_thresh=self._head_conf)
+                    print(f"[filter] 人头闸门 = head2 (TensorRT) "
+                          f"conf={self._head_conf}")
+                    self._head_state = "ok"
+                except Exception as e:
+                    print(f"[filter] !! 人头闸门(head2)加载失败，人头闸门关闭: {e}")
+                    self._head_state = "failed"
+            else:
+                self._head_state = "off"
+        return self._head_obj
+
+    @head.setter
+    def head(self, v) -> None:
+        self._head_obj = v         # 允许外部注入/覆盖(测试兼容)
+        if v is None and self._head_state == "pending":
+            self._head_state = "failed"
 
     # 判定单帧：返回 (verdict, score, (yaw,pitch,roll), down_ratio, nfaces)
     #   no_face : 0 张脸
@@ -1497,23 +1585,37 @@ class VideoFilter:
         """懒建 pynvvc-gpu 臂的设备侧资源（首次创建, 跨视频复用）：
         自研 pycuda 流 + 自研 kernel cubin + 显存帧池 + 与宿主臂同引擎文件的
         独立 SCRFD/head device 实例（绑定自研流, 与 NVDEC 解码器同流保序;
-        宿主臂实例 self.det / self.head 不受影响, 继续供回退路径使用）。"""
+        宿主臂实例 self.det / self.head 不受影响, 继续供回退路径使用）。
+        D 轮(§14): 宿主实例已懒加载, 此处只看 self._head_on / self._head_conf
+        配置, 不触碰 self.head（避免触发宿主实例无谓构建）。device 版 head
+        构建失败时与旧版宿主构建失败同语义: 打印 WARNING 后闸门全局关闭。"""
         if self._gpu is None:
             import pycuda.driver as _drv
             from src.gpu_decode import GpuKernels, DeviceFramePool
             from src.head_gate import HeadGate, _default_engine_path
             stream = _drv.Stream()
+            # D 轮(A 项): 解码器独立流 —— NVDEC+YUV→RGB 转换 kernel+D2D 走
+            # dstream, 消费 kernel 留主流; read_block 出口事件护栏保序
+            # (src/gpu_decode.py §14 保序证明)。
+            dstream = _drv.Stream()
             g = {"stream": stream,
+                 "dstream": dstream,
                  "kernels": GpuKernels(),
                  "pool": DeviceFramePool(),
                  "det": SCRFDTRTDetector(self.engine_path, max_batch=self.batch,
                                          conf_thres=self.conf)}
             g["det"].stream = stream
-            if self.head is not None:
-                g["head"] = HeadGate(
-                    self._head_engine_path or _default_engine_path(),
-                    conf_thresh=self.head.conf_thresh)
-                g["head"].stream = stream
+            if self._head_on:
+                try:
+                    g["head"] = HeadGate(
+                        self._head_engine_path or _default_engine_path(),
+                        conf_thresh=self._head_conf)
+                    g["head"].stream = stream
+                except Exception as e:
+                    print(f"[filter] !! 人头闸门(head2)加载失败，人头闸门关闭: {e}")
+                    g["head"] = None
+                    self._head_obj = None
+                    self._head_state = "failed"
             else:
                 g["head"] = None
             self._gpu = g
@@ -1563,6 +1665,34 @@ class VideoFilter:
             # OVL_SETS×(chunk+8): OVL_SETS 块一轮回, producer 领先
             # ≤ OVL_SETS-1 块(信号量 OVL_SETS token)
             use_overlap = self.overlap != "off"
+            # C 轮: 落地 pinned slab —— 首选 __init__ 预分配的 4K 容量 slab
+            # (见 __init__ 注释: cuMemHostAlloc 走驱动全局锁, 后台线程无法与
+            # CUDA 初始化真并行, 故一次付清在 r1 口径预热段); 预分配缺失/
+            # 容量不足(>4K 视频)/分配失败 → 原地按需分配; 再失败 → None →
+            # 可分页逐帧回退路径(逐字节同)。--overlap off 臂不开 pinned
+            # slab, 行为不变。
+            fb = h * w * 3
+            land_cap = (self.detect_chunk + 8) * fb
+            land_slabs = g.setdefault("_land_slabs", [None] * OVL_SETS)
+            while len(land_slabs) < OVL_SETS:      # 槽组 2→3 扩容(跨视频复用 g)
+                land_slabs.append(None)
+            land_sets = [None] * OVL_SETS
+            if use_overlap:
+                _pre = self._land_slabs_pre
+                for _si in range(OVL_SETS):
+                    if (land_slabs[_si] is not None
+                            and len(land_slabs[_si]) >= land_cap):
+                        continue                   # 已有足够大的 slab(跨视频复用)
+                    _p = _pre[_si] if _pre is not None else None
+                    if _p is not None and len(_p) >= land_cap:
+                        land_slabs[_si] = _p       # 吃预分配
+                    else:
+                        try:                       # 按需分配(与原实现同式)
+                            land_slabs[_si] = _drv.pagelocked_empty(
+                                (land_cap,), np.uint8)
+                        except Exception:
+                            land_slabs[_si] = None
+                land_sets = list(land_slabs)
             # 显存帧池: 末批溢出帧 ≤8 不覆盖本块未消费槽; 重叠臂 producer
             # 领先 ≤ OVL_SETS-1 块 → OVL_SETS 组槽轮换(token OVL_SETS 个:
             # D2D(j) 覆写的第 j%OVL_SETS 组上一用户是块 j-OVL_SETS(≤j-2),
@@ -1579,7 +1709,8 @@ class VideoFilter:
                 try:
                     src = _OverlappedGpuSource(video_path, w, h, fps,
                                                self.max_fps, stream, pool,
-                                               self.detect_chunk)
+                                               self.detect_chunk,
+                                               dstream=g["dstream"])
                 except _PynvvcDecodeError as e:
                     msg = str(e).splitlines()[0] if str(e) else "无输出"
                     print(f"  WARNING: 重叠解码(ThreadedDecoder)初始化失败"
@@ -1587,7 +1718,7 @@ class VideoFilter:
             if src is None:
                 # A 轮串行臂（--overlap off 或重叠初始化失败的回退, 逐位同基线）
                 src = _PynvvcGpuSource(video_path, w, h, fps, self.max_fps,
-                                       stream, pool)
+                                       stream, pool, dstream=g["dstream"])
             tables = AreaTables(w, h, nw7, nh7)   # INTER_AREA 路径判定+表(整视频复用)
             # 768 小图暂存（detect_chunk 个槽, 块间复用; 方法结束即释放）
             small_ga = GPUArray((self.detect_chunk * nh7 * nw7 * 3,), np.uint8)
@@ -1621,21 +1752,8 @@ class VideoFilter:
         # 零分配; async D2H 走 io 流不锁其它流。两套轮换 + 复用前等上一块
         # JPG futures(imwrite 线程池持有帧引用, 视频结束才统一 wait —— 套
         # 复用必须先确认引用已释放)。分配失败回退可分页逐帧路径(逐字节同)。
-        fb = h * w * 3
-        land_cap = (self.detect_chunk + 8) * fb
-        land_slabs = g.setdefault("_land_slabs", [None] * OVL_SETS)
-        while len(land_slabs) < OVL_SETS:      # 槽组 2→3 扩容(跨视频复用 g)
-            land_slabs.append(None)
-        land_sets = [None] * OVL_SETS
-        if use_overlap:
-            for _si in range(OVL_SETS):
-                if land_slabs[_si] is None or len(land_slabs[_si]) < land_cap:
-                    try:
-                        land_slabs[_si] = _drv.pagelocked_empty((land_cap,),
-                                                                np.uint8)
-                    except Exception:
-                        land_slabs[_si] = None
-                land_sets[_si] = land_slabs[_si]
+        # C 轮: 分配本体已提到帧源创建之前由后台线程执行(遮盖于解码器预热/
+        # AreaTables 构建), 见上方 slab_th; 首块 read_block 后 join。
         land_turn = 0
         land_futs = [None] * OVL_SETS
         # 临时 pose 报告（与 _run_pass 同格式同生命周期）
@@ -1835,7 +1953,7 @@ class VideoFilter:
                         verdict, gaze_mag, gaze_dy = self._gaze_apply(
                             gz, verdict, dy_all)
                         if (verdict == "keep" and nfaces == 1
-                                and self.head is not None):
+                                and g["head"] is not None):
                             head_jobs.append((i, frame))
                             head_meta[i] = (no, score, pose, down, nfaces,
                                             ear, gaze_mag, gaze_dy)
@@ -1849,7 +1967,7 @@ class VideoFilter:
                         no) in list(pre_map.items()):
                     frame = chunk.get(i)
                     if (verdict == "keep" and nfaces == 1
-                            and self.head is not None):
+                            and g["head"] is not None):
                         head_jobs.append((i, frame))
                         head_meta[i] = (no, score, pose, down, nfaces, ear,
                                         None, None)

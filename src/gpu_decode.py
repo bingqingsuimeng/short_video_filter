@@ -239,12 +239,22 @@ class _PynvvcGpuSource:
     EOF/断流语义与 _PynvvcSource 相同(干净 EOF → m=0; 提前断流 → 抛错回退)。"""
 
     def __init__(self, video, w, h, fps, max_fps, stream, pool,
-                 decoder="simple", buffer_size=16):
+                 decoder="simple", buffer_size=16, dstream=None):
         import filter_video as fv
         self.waited = 0.0
         self._closed = False
         self.w, self.h, self.fps = int(w), int(h), float(fps)
         self.stream = stream
+        # D 轮(A 项)流分流: 解码器(NVDEC 硬解 + YUV→RGB 转换 kernel)与帧
+        # D2D 入池走 dstream(独立流), 消费 kernel(area/letterbox/TRT/换序/
+        # 落地 D2H/head)留在主流 stream —— 转换 kernel(~0.31ms/帧)不再与
+        # 推理 kernel 在同一流上串行(§13.5: 共享流拉长解码窗口, 099
+        # +0.56s / 154 +1.65s / 214 +0.13s)。dstream=None → 退化为旧单流。
+        self.dstream = stream if dstream is None else dstream
+        # 出口事件护栏(每源一对句柄, 跨块复用): CUDA wait 捕获「wait 调用
+        # 时刻最近一次 record」, 同线程 record→wait 程序序 ⇒ 本块 wait 恒
+        # 绑定本块 record(下一块的 re-record 不影响已入队 wait)。
+        self._ev_d = drv.Event()
         self.pool = pool
         sd = fv._pynvvc_stride_delta(self.fps, max_fps)
         if sd is None:
@@ -264,10 +274,10 @@ class _PynvvcGpuSource:
                 # bufferSize: 解码先行帧数(16×4K RGB ≈ 400MB 显存);批量
                 # get_batch_frames(n) 要求 n ≤ bufferSize(探针2 T3)。
                 self.dec = _create_threaded_decoder(video, buffer_size,
-                                                    ctx, stream)
+                                                    ctx, self.dstream)
             else:
                 self.dec = pnv.CreateSimpleDecoder(
-                    video, 0, int(ctx.handle), int(stream.handle), True,
+                    video, 0, int(ctx.handle), int(self.dstream.handle), True,
                     0, 0, 0, 0, pnv.OutputColorType.RGB)
             md = self.dec.get_stream_metadata()
             self.num_frames = int(getattr(md, "num_frames", 0) or 0)
@@ -325,11 +335,19 @@ class _PynvvcGpuSource:
                         src_ptr = int(f.cuda()[0].dataptr)
                         drv.memcpy_dtod_async(self.pool.slot(self._slot),
                                               src_ptr, self._nbytes,
-                                              self.stream)
+                                              self.dstream)
                         self._slot += 1
                         copied += 1
                         self._next_want += self.stride
                 del frames
+            # D 轮(A 项)出口护栏: 主流后续消费 kernel(area/letterbox/TRT/
+            # 换序/落地 D2H/head)等本块全部 D2D 在 dstream 上完成 —— 两流
+            # 后「解码器写帧完成 → 消费读帧」的 happens-before 由该事件
+            # 钉死(替代旧同流程序序; §14 有完整保序证明)。串行臂同线程
+            # record→wait; 重叠臂由 producer 线程代入队(q_put 在 wait 之后
+            # ⇒ consumer 的 kernel 必排在 wait 之后, 无竞态窗口)。
+            self._ev_d.record(self.dstream)
+            self.stream.wait_for_event(self._ev_d)
         except Exception as e:
             self.waited += time.time() - t1
             raise fv._PynvvcDecodeError(
@@ -383,10 +401,22 @@ class _OverlappedGpuSource:
         第 k+OVL_SETS 块(同槽基址)的 D2D 在同一条流上必然排在其后
         (C 轮实测 2→3: 非首视频 e2e 变化 ≤0.04s=噪声, 首视频多付 ~0.55s
          一次性分配 —— producer 未被 token 饿住, 维持 2, 见 §12);
-      - 全程单一共享流(解码器写帧 / producer D2D / consumer kernel 同一条
-        pycuda 流), 程序序=执行序, 无需 event。探针2 T2 实测: 32 选帧横跨
-        多个 bufferSize=16 回收-覆写窗口, 生产者式 D2D(不 sync, 帧即拉即
-        释放)与同步参考逐字节一致。
+      - 流分流(D 轮 A 项): 解码器(NVDEC+转换 kernel)与 producer D2D 走
+        dstream(独立流), consumer kernel 留主流 stream —— 转换 kernel 不再
+        与推理 kernel 同流串行(§13.5 解码窗口拉长 099 +0.56s/154 +1.65s)。
+        两流后的保序(§14 完整证明):
+          ① D2D(j) → 消费读帧: read_block 出口 ev_d.record(dstream) →
+             stream.wait_for_event(ev_d) 在 q_put(j) 之前入队 ⇒ consumer
+             块 j 的 kernel 在流上恒排在该 wait 后 ⇒ 执行序晚于 D2D(j) 完成;
+          ② 消费读帧 → D2D(j+OVL_SETS) 覆写同组槽: token 协议 + 块内同步链
+             (scrfd_block_detect/_trt_pass、落地 D2H、head_slots_detect 均
+             stream.synchronize()) ⇒ pop(j-1) 释放 token 时块 j-1(及所有更早
+             块)的读槽 kernel 已设备侧完成, producer 解码第 j 块(≥NVDEC 一帧
+             延迟)远在其后 —— 与旧单流设计同一论证, 事件只加不减;
+          ③ 解码器内部帧缓冲回收: 写它的转换 kernel 与读它的 D2D 同在
+             dstream, 同流程序序保护(§10.5 enqueue-order 余量论证原样成立)。
+        探针2 T2 实测: 32 选帧横跨多个 bufferSize=16 回收-覆写窗口,
+        生产者式 D2D(不 sync, 帧即拉即释放)与同步参考逐字节一致。
       - 指针生命周期: ThreadedDecoder 的 device 帧不因 Python 持引用而保活
         (探针1 P5: 持有首批再拉 6 批, 8 槽全部被覆写) —— 与串行臂同款
         「批内立即 D2D」策略恰好是唯一正确姿势。
@@ -399,7 +429,7 @@ class _OverlappedGpuSource:
     回退链(宿主 pynvvc → 管道 → 落盘)不变。"""
 
     def __init__(self, video, w, h, fps, max_fps, stream, pool, chunk,
-                 buffer_size=16, first_chunk=16):
+                 buffer_size=16, first_chunk=16, dstream=None):
         self._chunk = int(chunk)
         self._first = int(first_chunk)   # 首块小批量: 消费端提前启动(削 ramp)
         self._half = self._chunk + 8     # 槽组大小(OVL_SETS 组一轮换)
@@ -413,7 +443,7 @@ class _OverlappedGpuSource:
         # 内层源在调用方线程构建(主线程有 CUDA context): 初始化失败同步抛出
         self._src = _PynvvcGpuSource(video, w, h, fps, max_fps, stream, pool,
                                      decoder="threaded",
-                                     buffer_size=buffer_size)
+                                     buffer_size=buffer_size, dstream=dstream)
         self._ctx = drv.Context.get_current()
         self._th = threading.Thread(target=self._produce, daemon=True,
                                     name="decode-producer-overlap")
