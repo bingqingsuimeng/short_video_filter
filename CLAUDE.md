@@ -17,3 +17,7 @@
 - 用户确认最终阈值前,不要删除临时的 score / angle 文件名和 `pose_report.csv`。
 - pip 一律用清华镜像:`-i https://pypi.tuna.tsinghua.edu.cn/simple`。
 - 与用户沟通用**中文**。
+
+## Nsight Systems(nsys)profiling
+
+凡涉及 nsys / profiling / GPU 时间线 / 性能排查:**先走项目 skill `.claude/skills/nsight-systems/SKILL.md`**(本机实战手册:实测采集配方、分析 SOP、kernel 名免 NVTX 归因法、避坑清单),不要重新调研。三条最致命的坑提前知道:中文 locale 下 report-fact/report-query 必挂(分析走 recipe + 报告副本放 C 盘);被测命令必须用 ASCII-only .bat 包装;nsys 注入会阉割子进程 stdout(本项目用 `SVF_PROBE_CACHE=1` 预生成元数据缓存绕过)。

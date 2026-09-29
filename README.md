@@ -224,6 +224,18 @@ python filter_video.py --image-dir <图片目录> --out-dir <输出目录>
   `frame,verdict,score,yaw,pitch,roll,down_ratio,nfaces,ear,gaze_mag,gaze_dy,nheads`
 - 图片文件夹模式额外:`REPORT.csv`(`filename,nheads`)+ `dropped.txt`
 
+## 性能剖析(Nsight Systems)
+
+本机装有 Nsight Systems 2026.5.1(`nsys` 已在 PATH),管线级的系统级剖析配方与全部踩坑记录在 `.claude/skills/nsight-systems/SKILL.md`(本机实战手册:实测采集命令、recipe 分析 SOP、kernel 名免 NVTX 归因法、中文 locale GBK bug 等避坑清单),nsys 相关任务直接按手册执行,无需重新调研。官方离线文档存档在 `docs/nsight-systems/`(内容大,grep 按问题检索)。剖析产物放 `E:\output\nsys\`;基准与各轮优化数据见 `data/e2e_benchmark_2026-09-28.md`。
+
+实测过的采集命令(完整配方与约束见上述手册):
+
+```bash
+nsys profile -t cuda,nvtx,nvvideo,python-gil --gpu-video-devices=0 \
+  --sample none --cpuctxsw none -o E:/output/nsys/<报告名> -f true \
+  <ASCII-only包装.bat> <app参数...>
+```
+
 ## 项目结构
 
 ```
