@@ -3346,9 +3346,9 @@ def main():
                          "max_seg=10@10fps)。按实际送检帧率换算 "
                          "max_seg=max(min_seg, round(此值*dec_fps)), off-table "
                          "fps 回退臂同样正确")
-    ap.add_argument("--dedup-per-shot-max", type=int, default=None,
-                    help="镜头感知采样: 每镜头送检配额上限 N(默认 None=关, "
-                         "逐段送检旧行为)。硬切(diff>=cut_hi)视为镜头边界, "
+    ap.add_argument("--dedup-per-shot-max", type=int, default=4,
+                    help="镜头感知采样: 每镜头送检配额上限 N(默认 4; 传 0 关闭"
+                         "=逐段送检旧行为)。硬切(diff>=cut_hi)视为镜头边界, "
                          "软切(diff>=cut_lo)为镜头内次级边界; 镜头内段数>N 时"
                          "不再逐段送检, 镜头内全部候选帧按清晰度排序只送最清晰 "
                          "q=max(N,--dedup-per-shot-min) 帧(仍逐帧过闸门)")
