@@ -2077,20 +2077,30 @@ class VideoFilter:
                "seconds": dt}
         return out
 
-    def run(self, targets, yaw_lim, shared_csv=False):
+    def run(self, targets, yaw_lim, shared_csv=False, on_video=None):
         """targets: list of (video_path, out_dir). shared_csv: 多视频共享同一
-        out_dir 时，CSV 按视频名区分（pose_report_<stem>.csv）防互相覆盖。"""
+        out_dir 时，CSV 按视频名区分（pose_report_<stem>.csv）防互相覆盖。
+        on_video: 可选回调 (i, n, video_path, out_stats, seconds)，每个视频
+        process() 成功返回后触发（失败不触发）；None=原行为。
+        返回 (results, failed, dt): results=[(video_path, out_stats), ...]。"""
         t0 = time.time()
         failed = []
+        results = []
         for i, (p, od) in enumerate(targets, 1):
             print(f"[{i}/{len(targets)}] {p}", flush=True)
+            t1 = time.time()
             try:
-                self.process(p, od, yaw_lim, shared_csv=shared_csv)
+                out = self.process(p, od, yaw_lim, shared_csv=shared_csv)
+                results.append((p, out))
+                if on_video is not None:
+                    on_video(i, len(targets), p, out, time.time() - t1)
             except Exception as e:   # 单视频失败不中断整批（无人值守长任务）
                 failed.append((p, str(e)))
                 print(f"  !! FAILED: {e}  (skip, continue)", flush=True)
-        print(f"\nAll done: {len(targets)} video(s) in {time.time() - t0:.1f}s"
+        dt = time.time() - t0
+        print(f"\nAll done: {len(targets)} video(s) in {dt:.1f}s"
               + (f", {len(failed)} FAILED: {[f[0] for f in failed]}" if failed else ""))
+        return results, failed, dt
 
 
 # ---------------- 图片文件夹模式（仅人头闸门，不碰视频解码/SCRFD/pose/gaze） ----------------
@@ -2213,11 +2223,63 @@ def process_image_dir(image_dir, out_dir, head, batch=16,
             "unread": unread, "seconds": dt}
 
 
+def merge_pose_reports(out_dir, video_files):
+    """目录批处理模式收尾: 把 out_dir 内逐视频 pose_report_<stem>.csv 合并为
+    pose_report_all.csv —— 首列 video(视频文件名, 含扩展名), 其余列与单视频
+    pose_report.csv 逐字节一致(行原样前缀 video, 不经 csv 库重序列化)。
+    合并后删除源 CSV(语义同 _test/batch225_merge.py)。
+    video_files: 按处理顺序的视频文件名字典序列表; 失败视频无源 CSV, 跳过并 WARN。
+    返回 (数据行数, 成功合并的视频数)。"""
+    header = ["video", "frame", "verdict", "score", "yaw", "pitch", "roll",
+              "down_ratio", "nfaces", "ear", "gaze_mag", "gaze_dy", "nheads"]
+    src_header = ",".join(header[1:])
+    total = merged = 0
+    all_path = os.path.join(out_dir, "pose_report_all.csv")
+    with open(all_path, "w", encoding="utf-8") as f:
+        f.write(",".join(header) + "\n")
+        for fn in video_files:
+            stem = os.path.splitext(fn)[0]
+            src = os.path.join(out_dir, f"pose_report_{stem}.csv")
+            if not os.path.isfile(src):
+                print(f"  WARNING: 缺少 {src}(该视频可能处理失败), "
+                      f"合并 CSV 不含其行")
+                continue
+            with open(src, encoding="utf-8") as sf:
+                lines = [ln for ln in sf.read().splitlines() if ln]
+            if not lines or lines[0] != src_header:
+                print(f"  WARNING: {src} 表头异常, 跳过")
+                continue
+            f.write("\n".join(f"{fn},{ln}" for ln in lines[1:]))
+            f.write("\n")
+            total += len(lines) - 1
+            merged += 1
+            os.remove(src)
+    print(f"  [merge] {merged}/{len(video_files)} 视频 -> {all_path} "
+          f"({total} 数据行), 源 pose_report_<stem>.csv 已并入删除")
+    return total, merged
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Filter a video to high-quality face frames (JPG), no re-encode.")
+    ap = argparse.ArgumentParser(
+        description="Filter a video to high-quality face frames (JPG), no re-encode.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""用法示例:
+  python filter_video.py video.mp4                    单视频 -> <视频所在目录>/<stem>_kept + pose_report.csv
+  python filter_video.py video_dir                     视频目录 -> <video_dir>/kept_frames/<stem>_kept 每视频一目录(旧行为)
+  python filter_video.py video_dir out_dir             目录批处理: 目录下全部视频(.mp4/.mkv/.mov/.avi,单层,按名排序),
+                                                       kept JPG 平铺进 out_dir(带视频 stem 前缀),
+                                                       CSV 合并为 out_dir/pose_report_all.csv(首列 video)
+  python filter_video.py video_dir out_dir --gaze-dy-dev 11
+                                                       所有 flag 与单视频模式完全相同(默认 --decode auto;
+                                                       显存直通臂显式加 --decode pynvvc-gpu, overlap 默认 auto)""")
     ap.add_argument("input", nargs="?", default=None,
                     help="mp4 file or a directory of videos "
                          "(可省略, 若用 --image-dir 跑纯图片文件夹模式)")
+    ap.add_argument("output", nargs="?", default=None,
+                    help="输出目录(第二位置参数, 仅当第一个位置参数是视频目录时有效): "
+                         "目录批处理模式——所有视频 kept JPG 平铺进该目录, "
+                         "pose_report 合并为 pose_report_all.csv(首列 video)。"
+                         "与 --out-dir 同时给时以本参数为准(WARN)")
     ap.add_argument("--out-dir", default=None,
                     help="output dir (default: <input_dir>/<stem>_kept for a file, "
                          "or <input_dir>/kept_frames/<stem>_kept for a directory; "
@@ -2374,13 +2436,26 @@ def main():
             sys.exit("[image-dir] 图片模式只依赖人头闸门, 与 --no-head-gate 冲突")
         from src.head_gate import HeadGate
         head = HeadGate(args.head_model_path, conf_thresh=args.head_conf)
-        out_dir = args.out_dir or (os.path.normpath(image_dir) + "_head")
+        out_dir = args.out_dir or args.output or (os.path.normpath(image_dir) + "_head")
         process_image_dir(image_dir, out_dir, head, batch=args.batch,
                           imread_workers=args.imread_workers,
                           verbose=args.verbose)
         return
     if args.input is None:
         ap.error("需要 input（视频/视频目录）或 --image-dir（纯图片目录）")
+
+    # ---------------- 目录批处理模式: python filter_video.py <input目录> <output目录> ----------------
+    # 两个位置参数: 第一=视频目录(单层), 第二=统一输出目录。复用现有
+    # 「目录输入 + 共享 out_dir」分支(逐视频 process()), 收尾合并 CSV。
+    dir_batch = False
+    if args.output is not None:
+        if args.out_dir is not None:
+            print(f"  WARNING: 同时给了第二位置参数(输出目录 {args.output}) 与 "
+                  f"--out-dir, 以第二位置参数为准(--out-dir 忽略)")
+        if not os.path.isdir(args.input):
+            ap.error("第二位置参数(输出目录)仅目录批处理模式有效: "
+                     "第一个位置参数必须是视频目录")
+        dir_batch = True
 
     root = os.path.dirname(os.path.abspath(__file__))
     if args.engine:
@@ -2400,10 +2475,34 @@ def main():
 
     # build explicit (video_path, out_dir) targets — avoids double-appending the suffix
     shared_csv = False
+    batch_out = None   # 目录批处理模式: 统一输出目录（收尾合并 CSV 用）
     if os.path.isdir(args.input):
         vids = sorted(os.path.join(args.input, f) for f in os.listdir(args.input)
                       if f.lower().endswith((".mp4", ".mkv", ".mov", ".avi")))
-        if args.out_dir:
+        if dir_batch:
+            # 目录批处理: 全部视频 kept JPG 平铺进 batch_out(带 stem 前缀不冲突),
+            # CSV 按视频名区分(pose_report_<stem>.csv)收尾合并为 pose_report_all.csv
+            batch_out = args.output
+            os.makedirs(batch_out, exist_ok=True)
+            _pre = [f for f in os.listdir(batch_out)
+                    if os.path.isfile(os.path.join(batch_out, f))]
+            if _pre:
+                print(f"  WARNING: 输出目录 {batch_out} 已有 {len(_pre)} 个文件, "
+                      f"同名 JPG/CSV 将被覆盖(重跑语义=更新)")
+            # 同 stem 不同扩展名(如 a.mp4 + a.mkv)理论重名风险预检:
+            _seen_stems = {}
+            for _p in vids:
+                _s = os.path.splitext(os.path.basename(_p))[0].lower()
+                if _s in _seen_stems:
+                    print(f"  WARNING: 输入内 {_seen_stems[_s]} 与 "
+                          f"{os.path.basename(_p)} 同 stem(忽略扩展名/大小写), "
+                          f"输出 JPG 可能互相覆盖, 建议先重命名输入")
+                _seen_stems[_s] = os.path.basename(_p)
+            if not vids:
+                sys.exit(f"{args.input} 下没有视频(.mp4/.mkv/.mov/.avi)")
+            targets = [(p, batch_out) for p in vids]
+            shared_csv = True
+        elif args.out_dir:
             # 显式 --out-dir + 目录输入 → 所有视频共享同一个文件夹
             # （文件名已含视频名不冲突；CSV 按视频名区分防覆盖）
             targets = [(p, args.out_dir) for p in vids]
@@ -2456,7 +2555,49 @@ def main():
                      pipeline_depth=args.pipeline_depth,
                      head_batch=args.head_batch,
                      overlap=args.overlap)
-    vf.run(targets, args.yaw, shared_csv=shared_csv)
+    if dir_batch:
+        # 目录批处理模式: 逐视频进度行 + 重名防护 + 收尾合并 CSV + 汇总
+        stems_done = []   # [(视频文件名, stem)] 已处理
+        out_listing = [set(os.listdir(batch_out))]   # 处理前目录快照(闭包共享)
+
+        def _on_video(i, n, p, out, dt):
+            stem = os.path.splitext(os.path.basename(p))[0]
+            # 重名防护: 本视频新增文件若撞上前面已处理视频的 stem 前缀
+            # (仅同目录不同扩展名同 stem 时可能), 加视频序号后缀防覆盖
+            cur = set(os.listdir(batch_out))
+            new_files = sorted(cur - out_listing[0])
+            out_listing[0] = cur
+            renamed = 0
+            for prev_fn, prev_stem in stems_done:
+                if prev_stem.lower() == stem.lower() and \
+                        prev_fn != os.path.basename(p):
+                    for fn in new_files:
+                        if fn.lower().startswith(stem.lower() + "_"):
+                            new = (fn[:-4] + f"_v{i}.jpg"
+                                   if fn.lower().endswith(".jpg")
+                                   else f"{fn}_v{i}")
+                            print(f"  WARNING: 输出重名 {fn} "
+                                  f"(与 {prev_fn} 同 stem), 改名为 {new}")
+                            os.replace(os.path.join(batch_out, fn),
+                                       os.path.join(batch_out, new))
+                            renamed += 1
+                    break
+            stems_done.append((os.path.basename(p), stem))
+            print(f"[{i}/{n}] {stem}: kept={out['kept']} 判定帧={out['frames']} "
+                  f"耗时{out['seconds']:.1f}s 臂={out['decode_mode']}"
+                  + (f" 重名改名{renamed}个" if renamed else ""), flush=True)
+
+        results, failed, dt = vf.run(targets, args.yaw, shared_csv=True,
+                                     on_video=_on_video)
+        merge_pose_reports(batch_out, [os.path.basename(p) for p, _ in targets])
+        total_kept = sum(o["kept"] for _, o in results)
+        print(f"\n[目录批处理] done={len(results)} failed={len(failed)} "
+              f"kept 合计={total_kept}  总墙钟 {dt:.1f}s  -> "
+              f"{os.path.abspath(batch_out)}")
+        if failed:
+            print(f"  failed 清单: {[os.path.basename(f[0]) for f in failed]}")
+    else:
+        vf.run(targets, args.yaw, shared_csv=shared_csv)
 
 
 if __name__ == "__main__":

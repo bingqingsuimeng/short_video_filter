@@ -191,6 +191,12 @@ compare100_*.csv)。
 python filter_video.py <video.mp4> --gaze-dy-dev 11
 ```
 
+目录批处理(两个位置参数:输入目录 + 统一输出目录)——输入目录下全部视频单层按名排序逐个处理,kept JPG 平铺进输出目录(带视频 stem 前缀),CSV 合并为输出目录的 `pose_report_all.csv`(首列 `video`):
+
+```bash
+python filter_video.py <视频目录> <输出目录>
+```
+
 常用参数(默认值均已在 `filter_video.py` argparse 中,上面表格为主):
 
 - `--out-dir <dir>`:输出目录。默认:单个文件 → `<input所在目录>/<stem>_kept`;目录输入(多视频)→ `<input目录>/kept_frames/<stem>_kept`,多视频共享同一 `--out-dir` 时 CSV 按视频名区分(`pose_report_<stem>.csv`)防覆盖
