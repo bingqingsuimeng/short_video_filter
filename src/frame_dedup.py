@@ -135,3 +135,87 @@ class FrameDedupSelector:
             self._seg = []
             return rep
         return None
+
+
+class SlotSegDeduper(FrameDedupSelector):
+    """显存槽号版段状态机 —— 与 FrameDedupSelector 的分段/选帧决策【逐行同构】,
+    供 --decode pynvvc-gpu --dedup 零拷贝臂使用。
+
+    差异只有一个: 帧不再以全分辨率 BGR ndarray 持有, 而是【显存池槽号】
+    (调用方保证槽内帧在段关闭+送检完成前不被覆写, 见 filter_video.py
+    _run_pass_gpu_dedup 的驻留池设计)。push_slot 的输入是两张小图(调用方
+    从 GPU INTER_AREA 核输出 D2H 而来, 与宿主 _gray_thumb 的 resize 输出
+    逐位一致) + 本帧字节数 + 槽号; diff/sharp 计算与段关闭判定三条件、
+    高分辨率 eff_max 自适应、_close_seg 的 rep/backups/meta 结构全部照抄
+    FrameDedupSelector.push/_close_seg, 一行未改语义 —— 宿主臂与 GPU 臂
+    因此对同一视频产出相同的段切分与 rep 选择。
+
+    push_slot(thumb_small, sharp_small, nbytes, slot, idx) 参数:
+      thumb_small : 长边 thumb_side 的 BGR 小图(未转灰度; 灰度化在此处用
+                    cv2 完成, 与宿主 _gray_thumb 的 cvtColor 同输入同结果)
+      sharp_small : 长边 sharp_side 的 BGR 小图
+      nbytes      : 全分辨率帧字节数(= h*w*3, eff_max 自适应用, 与宿主
+                    frame_bgr.nbytes 同值)
+      slot        : 本帧在显存驻留池中的槽号(meta['frames'] 以槽号代替帧)
+      idx         : 原始解码帧号(与宿主 push 的 frame_idx 同语义)
+    返回/flush 语义与 FrameDedupSelector 一致, 但 meta['frames'] 元组为
+    (idx, sharp, slot)。nbytes_total 基类实现取 seg[i][0].nbytes, 槽号版
+    改用 __init__ 传入的固定帧字节数(GPU 臂全部同尺寸)。"""
+
+    def __init__(self, *a, frame_bytes=0, **kw):
+        super().__init__(*a, **kw)
+        self._frame_bytes = int(frame_bytes)
+
+    def _close_seg(self):
+        """与 FrameDedupSelector._close_seg 逐行同构, 仅 nbytes_total 改用
+        固定帧字节数(段内帧全同尺寸, sum(frame.nbytes) 等价替换)。"""
+        seg = self._seg
+        order = sorted(range(len(seg)), key=lambda i: seg[i][3], reverse=True)
+        rep_i = order[0]
+        rep_frame, rep_idx, _, _ = seg[rep_i]
+        backups = [(seg[i][0], seg[i][1]) for i in order[1:1 + self.n_backups]]
+        frames_sorted = [(seg[i][1], seg[i][3], seg[i][0]) for i in order]
+        meta = {
+            "seg_id": self._seg_id,
+            "seg_start": seg[0][1],
+            "seg_end": seg[-1][1],
+            "rows": [(seg[i][1], seg[i][2], seg[i][3], 1 if i == rep_i else 0)
+                     for i in range(len(seg))],
+            "frames": frames_sorted,
+            "nbytes_total": self._frame_bytes * len(seg),
+        }
+        self._seg_id += 1
+        return rep_frame, rep_idx, backups, meta
+
+    def push_slot(self, thumb_small, sharp_small, nbytes, slot, idx):
+        thumb = cv2.cvtColor(thumb_small, cv2.COLOR_BGR2GRAY)
+        if self._prev_thumb is None:
+            diff = 0.0
+        else:
+            diff = float(np.abs(thumb.astype(np.int16)
+                                - self._prev_thumb.astype(np.int16)).mean())
+        self._prev_thumb = thumb
+        sharp = float(cv2.Laplacian(
+            cv2.cvtColor(sharp_small, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
+
+        close = False
+        if self._seg:
+            # 高分辨率自适应内存上限: 段内全分辨率帧总字节 <= max_mem_bytes
+            # (与 FrameDedupSelector.push 同式; nbytes=全分辨率帧字节)
+            eff_max = self.max_seg
+            if nbytes * eff_max > self.max_mem_bytes:
+                eff_max = max(self.min_seg, self.max_mem_bytes // nbytes)
+            n = len(self._seg)
+            if diff >= self.cut_hi:
+                close = True          # 1) 快速动作 / scene cut → 不漏帧
+            elif diff >= self.cut_lo and n >= self.min_seg:
+                close = True          # 2) 滞回防闪烁
+            elif n >= eff_max:
+                close = True          # 3) 时间上限兜底
+        if close:
+            rep = self._close_seg()
+            self._seg = []            # 旧段帧引用移交 meta['frames'], 由调用方
+            self._seg.append((slot, idx, diff, sharp))  # 在送检后释放
+            return rep
+        self._seg.append((slot, idx, diff, sharp))
+        return None

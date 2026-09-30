@@ -684,11 +684,12 @@ class VideoFilter:
         self.engine_path = engine                  # SCRFD 原引擎文件（device 臂同引擎另建实例）
         self._head_engine_path = head_model_path   # head 引擎路径（None → 默认解析）
         self._gpu = None
-        # D 轮懒加载(§14)收尾: 非 pynvvc-gpu 臂(含 --dedup——其显式回退宿主臂)
-        # 在 __init__ 内立即物化宿主 SCRFD/head 实例, 与旧行为逐字节同(引擎
-        # 加载在 run() 墙钟之外, r1 口径照旧单列); pynvvc-gpu 臂保持懒建 ——
-        # GPU 臂初始化失败回退宿主臂时首次访问 det/head 再建(回退链无损)。
-        if decode_mode != "pynvvc-gpu" or dedup:
+        # D 轮懒加载(§14)收尾: 非 pynvvc-gpu 臂在 __init__ 内立即物化宿主
+        # SCRFD/head 实例, 与旧行为逐字节同(引擎加载在 run() 墙钟之外, r1
+        # 口径照旧单列); pynvvc-gpu 臂保持懒建(--dedup 也走零拷贝臂, 同样
+        # 懒建) —— GPU 臂初始化失败回退宿主臂时首次访问 det/head 再建
+        # (回退链无损)。
+        if decode_mode != "pynvvc-gpu":
             _ = self.det
             if head_on:
                 _ = self.head
@@ -917,12 +918,8 @@ class VideoFilter:
         dec_fps = self.max_fps if apply_fps else fps
 
         mode = self.decode_mode
-        if mode == "pynvvc-gpu" and self.dedup:
-            # dedup 需要宿主全帧（缩略图/清晰度计算），显存直通臂不落宿主全帧
-            # → 显式警告并回退宿主 pynvvc 臂（选帧规则/帧内容相同）
-            print("  WARNING: --decode pynvvc-gpu 不支持 --dedup"
-                  "（需宿主全帧算清晰度），本次回退 pynvvc 宿主帧源", flush=True)
-            mode = "pynvvc"
+        # --decode pynvvc-gpu + --dedup 现已原生支持（GPU INTER_AREA 核顺带产出
+        # dedup 两张小图，段内帧驻留显存池，见 _run_pass_gpu_dedup），不再回退。
         # 解码帧源尝试顺序（失败逐级整体回退重跑，最终兜底 ffmpeg 落盘路径）：
         #   auto   : FFmpeg NVDEC 管道 → ffmpeg 落盘（默认，行为与旧版一致）
         #   pynvvc : PyNvVideoCodec 硬解 → FFmpeg NVDEC 管道 → ffmpeg 落盘
@@ -1521,8 +1518,13 @@ class VideoFilter:
                         cf.write(f"{no},{vd},{sc:.3f},{y:.1f},{p:.1f},{r:.1f},{dtag},{nf},{etag},{gtag},{gdt},{nht}\n")
             if dedup_rows:
                 # 仅 --dedup 时产出（与 pose_report.csv 并存，不动后者格式）：
-                # 逐解码帧的段切分/清晰度明细，供调 cut_lo/cut_hi
-                with open(os.path.join(out_dir, "dedup_report.csv"), "w",
+                # 逐解码帧的段切分/清晰度明细，供调 cut_lo/cut_hi。
+                # 共享 out_dir（目录批处理/显式 --out-dir）时按视频命名
+                # <stem>_dedup_report.csv 防互相覆盖（与 pose_report_<stem>.csv
+                # 同规则），单视频仍为 dedup_report.csv（向后兼容）。
+                _dname = (f"{stem}_dedup_report.csv" if shared_csv
+                          else "dedup_report.csv")
+                with open(os.path.join(out_dir, _dname), "w",
                           encoding="utf-8") as dfh:
                     dfh.write("frame,diff,seg_id,seg_start,seg_end,sharp,is_rep\n")
                     for (fi, dif, sid, s0, s1, sh, isrep) in dedup_rows:
@@ -1623,8 +1625,9 @@ class VideoFilter:
 
     def _run_pass_gpu(self, video_path, out_dir, yaw_lim, shared_csv,
                       w, h, size, fps, apply_fps, dec_fps, nframes, stem):
-        """--decode pynvvc-gpu: NVDEC device 帧显存直通零拷贝臂（仅非 dedup;
-        --dedup 时 process() 已显式警告并回退宿主 pynvvc 臂）。
+        """--decode pynvvc-gpu: NVDEC device 帧显存直通零拷贝臂。
+        --dedup 时改走 _run_pass_gpu_dedup（缩略图 GPU 化 + 段帧显存驻留），
+        非 dedup 路径保持原实现一行未改。
 
         判定流水与 _run_pass 非 dedup 分支逐行同逻辑（同计数器/同 CSV/同
         Stage2 dy 闸门/同 breakdown 行），区别只在帧的来源与去向：
@@ -1639,6 +1642,10 @@ class VideoFilter:
         送入各引擎的 blob 与宿主臂逐字节相同（配方验证 _test/post3_e2/e3），
         判定结果结构性一致。初始化/解码失败抛 _PynvvcDecodeError →
         process() 逐级回退 宿主 pynvvc → 管道 → 落盘 重跑。"""
+        if self.dedup:
+            return self._run_pass_gpu_dedup(
+                video_path, out_dir, yaw_lim, shared_csv, w, h, size, fps,
+                apply_fps, dec_fps, nframes, stem)
         import pycuda.driver as _drv
         from pycuda.gpuarray import GPUArray
         from src.gpu_decode import (AreaTables, OVL_SETS, _PynvvcGpuSource,
@@ -2077,6 +2084,573 @@ class VideoFilter:
                "seconds": dt}
         return out
 
+    def _run_pass_gpu_dedup(self, video_path, out_dir, yaw_lim, shared_csv,
+                            w, h, size, fps, apply_fps, dec_fps, nframes, stem):
+        """--decode pynvvc-gpu + --dedup: 零拷贝臂的抽帧去重模式。
+
+        与宿主 dedup 臂(_run_pass dedup 分支)逐位等价, 判定链复用同一批
+        宿主函数(_gate_judge/_gate_gaze/head.detect/pose68.estimate_batch),
+        区别只在数据搬运:
+          解码   = read_block(同 _PynvvcSource stride/delta 选帧), device 帧
+                   不落宿主全帧
+          小图   = 复用已验证的 INTER_AREA 核(area_fast/generic_u8, oswap=1)
+                   在 GPU 上从 RGB device 帧生成 dedup 两张 BGR 小图
+                   (thumb 128 / sharp 256 长边), 经 pinned 缓冲 D2H —— 与
+                   宿主 cv2.resize(BGR) 逐字节一致(_test/dedup_gpu_thumb_probe);
+                   灰度化留在宿主 cv2.cvtColor(小图输入字节与宿主臂相同,
+                   逐位等价由构造保证, 避免 cvtColor SIMD 路径复刻风险)
+          段状态 = SlotSegDeduper(与 FrameDedupSelector 逐行同构, 帧以驻留池
+                   槽号表示; 等价性 _test/dedup_slot_mirror_test.py)
+          驻留   = 段内帧 D2D 进独立驻留池(段关闭送检完成才释放槽位),
+                   解码池照常轮换 → 与 --overlap 无冲突(解码线程只覆写
+                   解码池; 驻留池由消费侧分配器管理)
+          送检   = 段批 rep/extras 槽位连续化 D2D 进 scratch → device SCRFD
+                   (按 det.max_batch 分批, 与宿主 det.detect 内部分批一致)
+                   → 人脸帧原地换序 BGR → 同步 D2H → 宿主 pose68 批量 →
+                   逐帧闸门链(与宿主 _judge_and_write 逐行同逻辑)
+        初始化/解码失败抛 _PynvvcDecodeError → process() 逐级回退
+        宿主 pynvvc → 管道 → 落盘 重跑。"""
+        import heapq
+        import pycuda.driver as _drv
+        from pycuda.gpuarray import GPUArray
+        from src.frame_dedup import SlotSegDeduper
+        from src.gpu_decode import (AreaTables, DeviceFramePool, OVL_SETS,
+                                    _OverlappedGpuSource, _PynvvcGpuSource,
+                                    scrfd_block_detect)
+        try:
+            g = self._ensure_gpu_arm()
+        except Exception as e:
+            raise _PynvvcDecodeError(f"pynvvc-gpu 臂初始化失败: {e!r}") from e
+        stream, kernels, pool = g["stream"], g["kernels"], g["pool"]
+
+        # SCRFD 768 长边几何（与非 dedup 臂同式: 只缩不放）
+        if self.target_long and max(h, w) > self.target_long:
+            sf = self.target_long / max(h, w)
+            nw7, nh7 = int(round(w * sf)), int(round(h * sf))
+            rescale = 1.0 / sf
+        else:
+            nw7, nh7 = w, h
+            rescale = 1.0
+
+        # dedup 两张小图几何（与宿主 _gray_thumb 逐行同式: s=side/long_side,
+        # int(w*s) 截断; long_side <= side 时不缩 → area fast 1x 路径覆盖）
+        def _small_geo(side):
+            if max(h, w) > side:
+                s = side / max(h, w)
+                return max(1, int(w * s)), max(1, int(h * s))
+            return w, h
+
+        tnw, tnh = _small_geo(self.dedup_thumb)
+        snw, snh = _small_geo(self.dedup_sharp_side)
+
+        try:
+            # 解码∥推理重叠(与非 dedup 臂同款; 驻留池设计解除了段帧与
+            # 解码池槽位复用的冲突, dedup 模式无需降级 overlap)
+            use_overlap = self.overlap != "off"
+            src = None
+            if use_overlap:
+                try:
+                    src = _OverlappedGpuSource(video_path, w, h, fps,
+                                               self.max_fps, stream, pool,
+                                               self.detect_chunk,
+                                               dstream=g["dstream"])
+                except _PynvvcDecodeError as e:
+                    msg = str(e).splitlines()[0] if str(e) else "无输出"
+                    print(f"  WARNING: 重叠解码(ThreadedDecoder)初始化失败"
+                          f"（{msg}），回退 A 轮串行臂", flush=True)
+            if src is None:
+                src = _PynvvcGpuSource(video_path, w, h, fps, self.max_fps,
+                                       stream, pool, dstream=g["dstream"])
+            tables = AreaTables(w, h, nw7, nh7)     # SCRFD 768 表
+            ttab = AreaTables(w, h, tnw, tnh)       # thumb 128 表
+            stab = AreaTables(w, h, snw, snh)       # sharp 256 表
+            small_ga = GPUArray((self.detect_chunk * nh7 * nw7 * 3,), np.uint8)
+            thumb_ga = GPUArray((self.detect_chunk * tnh * tnw * 3,), np.uint8)
+            sharp_ga = GPUArray((self.detect_chunk * snh * snw * 3,), np.uint8)
+            try:
+                thumb_host = _drv.pagelocked_empty(
+                    (self.detect_chunk * tnh * tnw * 3,), np.uint8)
+                sharp_host = _drv.pagelocked_empty(
+                    (self.detect_chunk * snh * snw * 3,), np.uint8)
+            except Exception:
+                thumb_host = np.empty((self.detect_chunk * tnh * tnw * 3,),
+                                      np.uint8)
+                sharp_host = np.empty((self.detect_chunk * snh * snw * 3,),
+                                      np.uint8)
+            # ---- dedup 显存驻留池(段内帧) + 检测连续化 scratch 池 ----
+            # 驻留池容量 = 挂起段帧数上限(与宿主 SEG_Q_BYTES/SEG_Q_CAP 同口径,
+            # 挂起段可跨块存活, 故用分配器复用而非游标回绕 —— 回绕会覆写
+            # 尚未送检的挂起段帧) + 本块帧数 + 段内上限 + 余量。
+            fb = h * w * 3
+            eff_max_est = self.dedup_max_seg
+            if fb * eff_max_est > self.dedup_max_mem * 1024 * 1024:
+                eff_max_est = max(self.dedup_min_seg,
+                                  int(self.dedup_max_mem * 1024 * 1024) // fb)
+            SEG_Q_CAP = max(8, self.detect_chunk // 4)
+            SEG_Q_BYTES = 160 * 1024 * 1024
+            left_frames = min((SEG_Q_CAP - 1) * eff_max_est,
+                              SEG_Q_BYTES // fb)
+            stage_cap = left_frames + self.detect_chunk + eff_max_est + 8
+            if stage_cap * fb > 3 * 1024 * 1024 * 1024:
+                raise _PynvvcDecodeError(
+                    f"dedup 显存驻留池超预算"
+                    f"({stage_cap * fb / 1024 ** 3:.1f}GB), 回退宿主臂")
+            if "dedup_stage" not in g:
+                g["dedup_stage"] = DeviceFramePool()
+            if "dedup_scratch" not in g:
+                g["dedup_scratch"] = DeviceFramePool()
+            stage = g["dedup_stage"]
+            scratch = g["dedup_scratch"]
+            # 主解码池(与非 dedup 臂同款; dedup 模式额外有驻留池)
+            pool.ensure((self.detect_chunk + 8)
+                        * (OVL_SETS if use_overlap else 1), h, w)
+            stage.ensure(stage_cap, h, w)
+            scratch.ensure(g["det"].max_batch + 8, h, w)
+            # 段状态机(与宿主 FrameDedupSelector 逐行同构, 槽号版)
+            deduper = SlotSegDeduper(
+                cut_lo=self.dedup_cut_lo, cut_hi=self.dedup_cut_hi,
+                min_seg=self.dedup_min_seg, max_seg=self.dedup_max_seg,
+                thumb_side=self.dedup_thumb,
+                sharp_side=self.dedup_sharp_side,
+                n_backups=self.dedup_backups,
+                max_mem_mb=self.dedup_max_mem, frame_bytes=fb)
+        except _PynvvcDecodeError:
+            raise
+        except Exception as e:
+            raise _PynvvcDecodeError(f"pynvvc-gpu 臂初始化失败: {e!r}") from e
+
+        if self.verbose:
+            print(f"  decode {os.path.basename(video_path)}  {w}x{h}  "
+                  f"src_fps={fps:.3f} -> dec_fps={dec_fps:.3f}"
+                  f"{' (downsampled)' if apply_fps else ''}  ~{nframes} frames"
+                  f"  hwdec=nvdec(dev)  src=pynvvc-gpu+dedup"
+                  f"  thumb={tnw}x{tnh}({ttab.kind})  sharp={snw}x{snh}"
+                  f"({stab.kind})  768={w}x{h}->{nw7}x{nh7}({tables.kind})"
+                  f"  overlap={'on' if isinstance(src, _OverlappedGpuSource) else 'off'}")
+
+        t0 = time.time()
+        frame_no = kept = drop_noface = drop_pose = drop_down = drop_multi = 0
+        drop_up = drop_blink = drop_downp = drop_gaze = drop_gazedown = 0
+        drop_head = 0
+        drop_toosmall = 0
+        t_dec = t_read = t_det = t_judge = t_gaze = t_write = 0.0
+        t_head = 0.0
+        ex = ThreadPoolExecutor(max_workers=self.jpg_workers)
+        futures = []
+        report = []
+        dy_all = []
+        dy_gate = []
+        decoded_frames = 0
+        dedup_rows = []   # (frame, diff, seg_id, seg_start, seg_end, sharp, is_rep)
+        seg_stats = {"segs": 0, "sent": 0, "reps": 0, "bk_judged": 0,
+                     "sec_judged": 0, "sec_hits": 0,
+                     "drop_seg": 0, "backup_hits": 0}
+        dedup_dy_hits = 0
+        try:
+            dec_mode = "pynvvc-gpu"
+            t_dec = 0.0
+            sec_fps = dec_fps if (dec_fps and dec_fps > 0) else 10.0
+            segs = []   # 已关闭待送检段: (rep_slot, rep_idx, backups, meta)
+
+            # ---- 驻留池槽分配器(最低自由槽优先, 确定性复用) ----
+            free_slots = []
+            stage_water = 0      # 从未分配过的最高水位
+
+            def _stage_alloc():
+                nonlocal stage_water
+                if free_slots:
+                    return heapq.heappop(free_slots)
+                if stage_water < stage_cap:
+                    s = stage_water
+                    stage_water += 1
+                    return s
+                return None
+
+            def _stage_release(slots):
+                for s in slots:
+                    heapq.heappush(free_slots, s)
+
+            def _count_drop(vd):
+                nonlocal drop_noface, drop_pose, drop_down, drop_multi
+                nonlocal drop_up, drop_blink, drop_downp, drop_gaze, drop_head
+                nonlocal drop_toosmall
+                if vd == "no_face":
+                    drop_noface += 1
+                elif vd == "down":
+                    drop_down += 1
+                elif vd == "downp":
+                    drop_downp += 1
+                elif vd == "multi":
+                    drop_multi += 1
+                elif vd == "up":
+                    drop_up += 1
+                elif vd == "blink":
+                    drop_blink += 1
+                elif vd == "gaze":
+                    drop_gaze += 1
+                elif vd == "multi_head":
+                    drop_head += 1
+                elif vd == "too_small":
+                    drop_toosmall += 1
+                else:
+                    drop_pose += 1
+
+            def _to_host_bgr(slot):
+                """驻留池槽 RGB → 原地换序 BGR → 同步 D2H 落宿主(与非 dedup 臂
+                pinned 失败回退路径同款 memcpy_dtoh 同步写法)。调用方保证同一
+                槽至多换序一次, 且换序后不再走 RGB 通道序的检测核(rep 不进
+                extras 补判名单, 与宿主臂排除规则一致)。"""
+                kernels.swap_inplace(stream, stage.slot(slot), h * w)
+                fr = np.empty((h, w, 3), np.uint8)
+                _drv.memcpy_dtoh(fr.reshape(-1), stage.slot(slot))
+                return fr
+
+            def _detect_slots(slot_list):
+                """驻留槽位列表 → 按 det.max_batch 分批: 连续化 D2D 进 scratch
+                → device SCRFD。分批边界与宿主 det.detect 内部分批一致
+                (同帧同批 → dets/kpss 逐位一致)。"""
+                dets, kpss = [], []
+                mb = g["det"].max_batch
+                for c0 in range(0, len(slot_list), mb):
+                    grp = slot_list[c0:c0 + mb]
+                    for i, sl in enumerate(grp):
+                        _drv.memcpy_dtod_async(scratch.slot(i),
+                                               stage.slot(sl), fb, stream)
+                    d_i, k_i = scrfd_block_detect(
+                        kernels, g["det"], stream, scratch, 0, len(grp),
+                        h, w, small_ga, nh7, nw7, rescale, tables, self.conf)
+                    dets.extend(d_i)
+                    kpss.extend(k_i)
+                return dets, kpss
+
+            def _pose_batch(items):
+                """(批内序号, 宿主 BGR, bbox) → 批量 pose68(与宿主 _detect_batch
+                同一次 estimate_batch 调用式, 批成员一致 → pose 逐位一致)。"""
+                if self.pose68 is not None and items:
+                    poses = self.pose68.estimate_batch(
+                        [(fr, bb) for _, fr, bb in items])
+                    return {i: p for (i, _, _), p in zip(items, poses)}
+                return {}
+
+            def _face_land(slot_list, dets):
+                """人脸帧(非 too_small)D2H 落宿主, 返回 (items, frames)。
+                items/frames 键=批内序号; 规则与宿主 _detect_batch 一致。"""
+                items = []
+                for i, d in enumerate(dets):
+                    if len(d) > 0:
+                        top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
+                        if (self.min_face_h and self.min_face_h > 0
+                                and (d[top, 3] - d[top, 1]) < self.min_face_h):
+                            continue
+                        items.append((i, _to_host_bgr(slot_list[i]),
+                                      d[top, :4]))
+                frames = {i: fr for i, fr, _ in items}
+                return items, frames
+
+            def _judge_and_write(frame, idx, d, k, p68):
+                """与 _run_pass dedup 分支 _judge_and_write 逐行同逻辑; 闸门链
+                拆两段: Stage1(_gate_judge, 不触像素)在 D2H 之后, keep 才进
+                gaze/head(与 _gate_chain 的级联次序逐行一致) —— no_face /
+                multi 帧不触碰像素(frame=None 亦安全)。"""
+                nonlocal frame_no, kept, t_judge, t_gaze, t_head, drop_toosmall
+                if (self.min_face_h and self.min_face_h > 0
+                        and len(d) > 0):
+                    top = int(np.argmax(d[:, 4])) if len(d) > 1 else 0
+                    if (d[top, 3] - d[top, 1]) < self.min_face_h:
+                        frame_no += 1
+                        score = float(d[top, 4])
+                        if self.score_name:
+                            report.append([idx, "too_small", score, 0.0, 0.0,
+                                           0.0, None, len(d), None, None,
+                                           None, None])
+                        drop_toosmall += 1
+                        if self.verbose:
+                            print(f"    #{idx:05d} drop  (too_small  "
+                                  f"fh={d[top, 3]-d[top, 1]:.0f})")
+                        return False
+                (verdict, score, pose, down, nfaces, ear,
+                 _tj) = self._gate_judge(frame, d, k, p68)
+                t_judge += _tj
+                gaze_mag = gaze_dy = None
+                nheads = None
+                if verdict == "keep":
+                    verdict, gaze_mag, gaze_dy, _tg = self._gate_gaze(
+                        frame, d, verdict, nfaces, dy_all)
+                    t_gaze += _tg
+                    if (verdict == "keep" and nfaces == 1
+                            and self.head is not None):
+                        t1 = time.time()
+                        _hb = self.head.detect(frame)
+                        t_head += time.time() - t1
+                        nheads = len(_hb)
+                        if nheads >= 2:
+                            verdict = "multi_head"
+                frame_no += 1   # = 送检帧数(reps + backup 补判)
+                yaw, pitch, roll = pose
+                if self.score_name:
+                    report.append([idx, verdict, score, yaw, pitch,
+                                   roll, down, nfaces, ear, gaze_mag,
+                                   gaze_dy, nheads])
+                if verdict == "keep":
+                    base = f"{stem}_{idx:05d}"
+                    name = (f"{base}_{score:.2f}_{yaw:.0f}_{pitch:.0f}_{roll:.0f}.jpg"
+                            if self.score_name else f"{base}.jpg")
+                    futures.append(ex.submit(
+                        cv2.imwrite, os.path.join(out_dir, name), frame,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), int(self.jpg_q)]))
+                    kept += 1
+                    if self.gaze_dy_dev > 0 and gaze_dy is not None:
+                        dy_gate.append((idx, os.path.join(out_dir, name),
+                                        gaze_dy))
+                    if self.verbose:
+                        print(f"    #{idx:05d} KEEP  score={score:.3f} "
+                              f"yaw={yaw:.0f} pit={pitch:.0f} rol={roll:.0f} "
+                              f"down={down:.2f}")
+                    return True
+                _count_drop(verdict)
+                if self.verbose:
+                    print(f"    #{idx:05d} drop  ({verdict}  down={down})")
+                return False
+
+            def _process_seg_batch(sb):
+                """与 _run_pass dedup 分支 _process_seg_batch 逐行同逻辑(段批
+                rep 送检→闸门→sec/scan 补判 early-stop), 帧来源改驻留池槽。"""
+                seg_stats["segs"] += len(sb)
+                rep_slots = [s[0] for s in sb]
+                dets, kpss = _detect_slots(rep_slots)
+                items, rep_frames = _face_land(rep_slots, dets)
+                pose_map = _pose_batch(items)
+                jobs = []         # job_pos → (kind, satisfied_set)
+                extra_items = []  # (job_pos, kind, sec_or_None, slot, idx)
+                for si, seg in enumerate(sb):
+                    _, rep_idx, _bk, meta = seg
+                    seg_stats["sent"] += 1
+                    seg_stats["reps"] += 1
+                    ok = _judge_and_write(rep_frames.get(si), rep_idx,
+                                          dets[si], kpss[si],
+                                          pose_map.get(si))
+                    job_pos = len(jobs)
+                    if ok:
+                        rep_sec = rep_idx // sec_fps
+                        by_sec = {}
+                        for (idx, _sh, sl) in meta["frames"]:
+                            s2 = idx // sec_fps
+                            if s2 != rep_sec:
+                                by_sec.setdefault(s2, []).append((sl, idx))
+                        if by_sec:
+                            jobs.append(("sec", set()))
+                            for s2 in sorted(by_sec):
+                                for (sl, idx) in by_sec[s2]:
+                                    extra_items.append(
+                                        (job_pos, "sec", s2, sl, idx))
+                    else:
+                        jobs.append(("scan", set()))
+                        for (idx, _sh, sl) in meta["frames"]:
+                            if idx != rep_idx:
+                                extra_items.append(
+                                    (job_pos, "scan", None, sl, idx))
+                solved_scan = set()
+                if extra_items:
+                    ex_slots = [it[3] for it in extra_items]
+                    dets_e, kpss_e = _detect_slots(ex_slots)
+                    items_e, ex_frames = _face_land(ex_slots, dets_e)
+                    pose_map_e = _pose_batch(items_e)
+                    for ei, (job_pos, kind, s2, sl, idx) in enumerate(extra_items):
+                        if kind == "scan" and job_pos in solved_scan:
+                            continue
+                        if kind == "sec" and s2 in jobs[job_pos][1]:
+                            continue   # 该秒已有 keep, 剩余候选跳过
+                        seg_stats["sent"] += 1
+                        if kind == "scan":
+                            seg_stats["bk_judged"] += 1
+                        else:
+                            seg_stats["sec_judged"] += 1
+                        if _judge_and_write(ex_frames.get(ei), idx,
+                                            dets_e[ei], kpss_e[ei],
+                                            pose_map_e.get(ei)):
+                            if kind == "scan":
+                                seg_stats["backup_hits"] += 1
+                                solved_scan.add(job_pos)
+                            else:
+                                seg_stats["sec_hits"] += 1
+                                jobs[job_pos][1].add(s2)
+                for job_pos, (kind, _sat) in enumerate(jobs):
+                    if kind == "scan" and job_pos not in solved_scan:
+                        seg_stats["drop_seg"] += 1
+                # 本批全部送检完成 → 段内全部驻留槽归还(meta['frames'] 覆盖
+                # 全段帧, 含 rep/backups)
+                for seg in sb:
+                    _stage_release([sl for (_idx, _sh, sl) in seg[3]["frames"]])
+
+            def _drain_segs():
+                while (len(segs) >= SEG_Q_CAP
+                       or sum(s[3]["nbytes_total"] for s in segs) > SEG_Q_BYTES):
+                    n = min(len(segs), self.detect_chunk)
+                    _process_seg_batch(segs[:n])
+                    del segs[:n]
+
+            while True:
+                s0, m = src.read_block(self.detect_chunk)  # 等待已累计进 waited
+                if m == 0:
+                    break
+                # GPU 顺带产出两张小图(复用已验证 INTER_AREA 核, RGB→BGR)
+                t1 = time.time()
+                kernels.area_batch(stream, pool.slot(s0),
+                                   thumb_ga.__cuda_array_interface__["data"][0],
+                                   m, h, w, tnh, tnw, ttab, oswap=1)
+                kernels.area_batch(stream, pool.slot(s0),
+                                   sharp_ga.__cuda_array_interface__["data"][0],
+                                   m, h, w, snh, snw, stab, oswap=1)
+                _drv.memcpy_dtoh_async(thumb_host,
+                                       thumb_ga.__cuda_array_interface__["data"][0],
+                                       stream)
+                _drv.memcpy_dtoh_async(sharp_host,
+                                       sharp_ga.__cuda_array_interface__["data"][0],
+                                       stream)
+                stream.synchronize()
+                t_dec += time.time() - t1   # 小图生成+D2H 计入 decode 段
+                # 逐帧: D2D 驻留 + 宿主段状态机(与 _run_pass dedup 分支同构,
+                # 帧序/帧号口径一致)。排水按【累计解码帧数每 detect_chunk 帧】
+                # 触发 —— 宿主臂按 64 帧读块推帧后排水, 本臂 overlap 首块只
+                # 有 16 帧, 按块排水会使段批分组与宿主错位(report 行序/送检
+                # 批次漂移), 故用计数器对齐累计帧数 64k 的排水点。
+                for j in range(m):
+                    sl = _stage_alloc()
+                    if sl is None:
+                        raise _PynvvcDecodeError(
+                            "dedup 显存驻留池耗尽(段挂起超预算), 回退宿主臂")
+                    _drv.memcpy_dtod_async(stage.slot(sl), pool.slot(s0 + j),
+                                           fb, stream)
+                    tb = tnh * tnw * 3
+                    sb = snh * snw * 3
+                    tv = thumb_host[j * tb:(j + 1) * tb].reshape(tnh, tnw, 3)
+                    sv = sharp_host[j * sb:(j + 1) * sb].reshape(snh, snw, 3)
+                    decoded_frames += 1
+                    res = deduper.push_slot(tv, sv, fb, sl, decoded_frames)
+                    if res is not None:
+                        rep_sl, rep_idx, backups, meta = res
+                        segs.append((rep_sl, rep_idx, backups, meta))
+                        for (fi, dif, sh, isrep) in meta["rows"]:
+                            dedup_rows.append(
+                                (fi, dif, meta["seg_id"],
+                                 meta["seg_start"], meta["seg_end"],
+                                 sh, isrep))
+                    if decoded_frames % self.detect_chunk == 0:
+                        _drain_segs()
+            # EOF: 宿主臂在最后一个不满 detect_chunk 的读块末尾也会排水一次
+            # (_run_pass 行业 1284), 这里补同一次排水, 保证尾部段的送检批次
+            # 与宿主臂逐位同序
+            _drain_segs()
+            res = deduper.flush()   # EOF 强关最后一段
+            if res is not None:
+                rep_sl, rep_idx, backups, meta = res
+                segs.append((rep_sl, rep_idx, backups, meta))
+                for (fi, dif, sh, isrep) in meta["rows"]:
+                    dedup_rows.append(
+                        (fi, dif, meta["seg_id"],
+                         meta["seg_start"], meta["seg_end"], sh, isrep))
+            # 排空剩余段(EOF 后不再依赖触发条件; 与宿主臂同口径)
+            while segs:
+                n = min(len(segs), self.detect_chunk)
+                _process_seg_batch(segs[:n])
+                del segs[:n]
+
+            # NVDEC 拉帧+D2D 等待(read_block 内部累计)计入 decode 段
+            t_dec += src.waited
+
+            # 排空 JPEG 线程池
+            t1 = time.time()
+            wait(futures)
+            t_write = time.time() - t1
+
+            # Stage2 纵向眼神闸门(2-pass 后半, 与 _run_pass 逐行同逻辑)
+            if self.gaze_dy_dev > 0 and len(dy_all) >= 3:
+                med = float(np.median(dy_all))
+                hit = {}
+                for no, path, dy in dy_gate:
+                    if abs(dy - med) > self.gaze_dy_dev:
+                        hit[no] = dy
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+                if hit:
+                    kept -= len(hit)
+                    drop_gazedown += len(hit)
+                    dedup_dy_hits += len(hit)
+                    for r in report:
+                        if r[0] in hit:
+                            r[1] = "gazedown"
+                    if self.verbose:
+                        for no, dy in sorted(hit.items()):
+                            print(f"    #{no:05d} drop (gazedown dy={dy:.3f} "
+                                  f"med={med:.3f})")
+
+            if report:
+                csv_name = (f"pose_report_{stem}.csv" if shared_csv
+                            else "pose_report.csv")
+                csv_path = os.path.join(out_dir, csv_name)
+                with open(csv_path, "w", encoding="utf-8") as cf:
+                    cf.write("frame,verdict,score,yaw,pitch,roll,down_ratio,nfaces,ear,gaze_mag,gaze_dy,nheads\n")
+                    for (no, vd, sc, y, p, r, dn, nf, er, gm, gd, nh) in report:
+                        dtag = f"{dn:.3f}" if dn is not None else ""
+                        etag = f"{er:.3f}" if er is not None else ""
+                        gtag = f"{gm:.3f}" if gm is not None else ""
+                        gdt = f"{gd:.3f}" if gd is not None else ""
+                        nht = f"{nh}" if nh is not None else ""
+                        cf.write(f"{no},{vd},{sc:.3f},{y:.1f},{p:.1f},{r:.1f},{dtag},{nf},{etag},{gtag},{gdt},{nht}\n")
+            if dedup_rows:
+                # 共享 out_dir(目录批处理/显式 --out-dir)按视频命名防互相覆盖;
+                # 单视频保持 dedup_report.csv(向后兼容)
+                _dname = (f"{stem}_dedup_report.csv" if shared_csv
+                          else "dedup_report.csv")
+                with open(os.path.join(out_dir, _dname), "w",
+                          encoding="utf-8") as dfh:
+                    dfh.write("frame,diff,seg_id,seg_start,seg_end,sharp,is_rep\n")
+                    for (fi, dif, sid, s0, s1, sh, isrep) in dedup_rows:
+                        dfh.write(f"{fi},{dif:.3f},{sid},{s0},{s1},{sh:.1f},{isrep}\n")
+        finally:
+            src.close()
+            ex.shutdown(wait=True)
+
+        dt = time.time() - t0
+        dm = f"{self.down_min:g}" if self.down_min is not None else "?"
+        head_label = f"decoded {decoded_frames} -> sent {frame_no}"
+        rate = decoded_frames / dt
+        print(f"  {os.path.basename(video_path)}: {head_label} -> "
+              f"kept {kept}  (drop {drop_noface} no-face, {drop_pose} pose, "
+              f"{drop_up} up, {drop_downp} downp, {drop_gaze} gaze, "
+              f"{drop_gazedown} gazedown, {drop_blink} blink, "
+              f"{drop_down} down<{dm}, {drop_multi} multi, "
+              f"{drop_head} multi-head, {drop_toosmall} too-small)  "
+              f"in {dt:.1f}s ({rate:.0f} fps)  -> {os.path.abspath(out_dir)}")
+        print(f"    [breakdown] decode={t_dec:5.2f}s  read={t_read:5.2f}s  "
+              f"detect={t_det:5.2f}s  judge={t_judge:5.2f}s  gaze={t_gaze:5.2f}s  "
+              f"head={t_head:5.2f}s  imwrite={t_write:5.2f}s ({kept} frames)")
+        print(f"    [dedup] segments={seg_stats['segs']}  "
+              f"reps={seg_stats['reps']}  "
+              f"backup-judged={seg_stats['bk_judged']}  "
+              f"backup-hit={seg_stats['backup_hits']}  "
+              f"sec-judged={seg_stats['sec_judged']}  "
+              f"sec-hit={seg_stats['sec_hits']}  "
+              f"drop_seg={seg_stats['drop_seg']}  "
+              f"compression={decoded_frames / max(frame_no, 1):.2f}x  "
+              f"dy-gate-hits(dedup kept)={dedup_dy_hits}")
+        out = {"frames": frame_no, "kept": kept, "no_face": drop_noface,
+               "decode_mode": dec_mode,
+               "pose": drop_pose, "down": drop_down, "multi": drop_multi,
+               "up": drop_up, "downp": drop_downp, "gaze": drop_gaze,
+               "gazedown": drop_gazedown, "blink": drop_blink,
+               "head": drop_head, "toosmall": drop_toosmall,
+               "pipeline": False, "pipe_depth": self.pipeline_depth,
+               "overlap": isinstance(src, _OverlappedGpuSource),
+               "decoded": decoded_frames, "segments": seg_stats["segs"],
+               "drop_seg": seg_stats["drop_seg"],
+               "backup_hits": seg_stats["backup_hits"],
+               "dedup_dy_hits": dedup_dy_hits,
+               "seconds": dt}
+        return out
+
     def run(self, targets, yaw_lim, shared_csv=False, on_video=None):
         """targets: list of (video_path, out_dir). shared_csv: 多视频共享同一
         out_dir 时，CSV 按视频名区分（pose_report_<stem>.csv）防互相覆盖。
@@ -2259,6 +2833,40 @@ def merge_pose_reports(out_dir, video_files):
     return total, merged
 
 
+def merge_dedup_reports(out_dir, video_files):
+    """目录批处理模式收尾: 把 out_dir 内逐视频 <stem>_dedup_report.csv 合并为
+    dedup_report_all.csv —— 风格与 merge_pose_reports 一致(首列 video,
+    行原样前缀, 合并后删除源 CSV)。--dedup 未产出文件的视频跳过并 WARN
+    (dedup 关闭或该视频无行)。返回 (数据行数, 成功合并的视频数)。"""
+    header = ["video", "frame", "diff", "seg_id", "seg_start", "seg_end",
+              "sharp", "is_rep"]
+    src_header = ",".join(header[1:])
+    total = merged = 0
+    all_path = os.path.join(out_dir, "dedup_report_all.csv")
+    with open(all_path, "w", encoding="utf-8") as f:
+        f.write(",".join(header) + "\n")
+        for fn in video_files:
+            stem = os.path.splitext(fn)[0]
+            src = os.path.join(out_dir, f"{stem}_dedup_report.csv")
+            if not os.path.isfile(src):
+                continue   # 无 --dedup 时整批都没有, 静默; 单视频缺失见下
+            with open(src, encoding="utf-8") as sf:
+                lines = [ln for ln in sf.read().splitlines() if ln]
+            if not lines or lines[0] != src_header:
+                print(f"  WARNING: {src} 表头异常, 跳过")
+                continue
+            f.write("\n".join(f"{fn},{ln}" for ln in lines[1:]))
+            f.write("\n")
+            total += len(lines) - 1
+            merged += 1
+            os.remove(src)
+    if merged or os.path.isfile(all_path):
+        print(f"  [merge] dedup 明细 {merged}/{len(video_files)} 视频 -> "
+              f"{all_path} ({total} 数据行)"
+              + (", 源 <stem>_dedup_report.csv 已并入删除" if merged else ""))
+    return total, merged
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Filter a video to high-quality face frames (JPG), no re-encode.",
@@ -2370,8 +2978,9 @@ def main():
                          "失败同样逐级回退 管道→落盘）；pynvvc-gpu=显存直通零拷贝臂"
                          "（NVDEC device 帧不落宿主: 自研 INTER_AREA/letterbox 核在显存"
                          "完成预处理 → 原引擎零拷贝推理, blob 与宿主臂逐字节相同, 判定"
-                         "结构性一致; 仅人脸帧 D2H 落地, 不支持 --dedup 会显式警告并回退 "
-                         "pynvvc; 表外帧率/失败逐级回退 pynvvc→管道→落盘）；"
+                         "结构性一致; 仅人脸帧 D2H 落地; 支持 --dedup（缩略图 GPU 生成"
+                         " + 段内帧显存驻留, 判定与宿主 dedup 臂逐位一致）; "
+                         "表外帧率/失败逐级回退 pynvvc→管道→落盘）；"
                          "ffmpeg=现有 3GB raw 落盘路径（旧行为，一行未改）。"
                          "--hw-decode 对 auto/gpu/ffmpeg 路径均生效")
     ap.add_argument("--pipeline", action=argparse.BooleanOptionalAction, default=True,
@@ -2590,6 +3199,9 @@ def main():
         results, failed, dt = vf.run(targets, args.yaw, shared_csv=True,
                                      on_video=_on_video)
         merge_pose_reports(batch_out, [os.path.basename(p) for p, _ in targets])
+        if args.dedup:
+            merge_dedup_reports(batch_out,
+                                [os.path.basename(p) for p, _ in targets])
         total_kept = sum(o["kept"] for _, o in results)
         print(f"\n[目录批处理] done={len(results)} failed={len(failed)} "
               f"kept 合计={total_kept}  总墙钟 {dt:.1f}s  -> "
