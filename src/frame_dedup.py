@@ -137,6 +137,176 @@ class FrameDedupSelector:
         return None
 
 
+class ShotTracker:
+    """镜头感知采样(镜头切分 + 镜头内配额 + 保底)的镜头侧记账器。
+
+    与 FrameDedupSelector/SlotSegDeduper(段状态机)配合: 段每关闭一段, 调用方把
+    段元组 (rep, rep_idx, backups, meta) 连同 meta['frames'](帧引用列表, 宿主臂
+    =ndarray, GPU 臂=驻留池槽号)交给本类。镜头判定完全复用段状态机的既有决策,
+    本类【不改变】任何 diff/关段逻辑:
+
+      * 镜头边界 = 段首帧 diff >= cut_hi(硬切)。段状态机里 diff>=cut_hi 恒为
+        第 1 优先关段条件, 且该触发帧成为下一段首帧 → 「下一段 rows[0][1]
+        (diff) >= cut_hi」⟺ 上一次关段是硬切。软切(cut_lo)/兜底切(max_seg)
+        均为镜头内次级边界, 镜头延续(长静止镜头被 max_seg 切出的众多段同属
+        一个镜头 —— 这正是配额要压的对象)。
+
+      * 送检配额(per_shot_max=N, 默认 None=关): 镜头内关闭段数 > N 时激活,
+        该镜头不再逐段送检; 镜头内【全部候选帧】按清晰度降序(平局取帧号小者,
+        与段内 argmax 稳定排序同约定)只保留最清晰 q=max(N, per_shot_min) 帧
+        送检, 逐帧仍过完整闸门链(闸门逻辑零改动)。未入选帧的引用立即经
+        release 回调归还(宿主臂=解引用交给 GC, GPU 臂=归还驻留池槽位),
+        缓冲有界(<= q 帧 + 当前段)。
+
+      * 镜头保底(per_shot_min=M, 默认 1): 每镜头至少 M 帧送检。旧逐段 rep
+        机制天然满足 M=1(每镜头至少 1 段、每段至少送 1 个 rep); M>1 且镜头
+        段数 < M 时, 在该镜头逐段流处理完后, 按「段内回退序」(逐段时间序、
+        段内清晰度降序 —— 即非配额镜头 rep 被 drop 时的既有回退序)对未判过
+        的帧补判至 M 帧送检(由调用方执行, 本类只出 topup 名单)。
+
+      * 内存护栏 mem_guard_bytes: 镜头缓冲字节超护栏时 —— 配额可用则立即激活
+        (缩到 q 帧); 仅 min 模式(per_shot_max=None)无配额可用则强制关镜头
+        (close_reason=memcap), 防超长镜头缓冲爆内存。纯记录模式不持帧, 不触发。
+
+    两种用法:
+      * 纯记录模式 add_segment(seg, frames=None): 只记镜头表(shot_id/起止帧/
+        帧数/段数)与 idx→镜头 映射(note_judged 记账 sent), 不持有任何
+        seg/meta/帧引用, 不改变调用方送检流 —— 默认参数下逐字节零影响。
+      * 配额模式 add_segment(seg, meta['frames']): 返回因本段而关闭的镜头工作
+        项(0/1 个), 调用方把工作项替代裸段元组入送检队列; 工作项分两种:
+          quota=True : {"sel": [(idx, ref), ...] 时间序送检名单, 无逐段流}
+          quota=False: {"segs": [段元组, ...], "topup": [(idx, ref), ...]}
+        item["release"] = 处理完后需归还的引用清单(各引用恰归还一次)。
+    """
+
+    def __init__(self, cut_hi, per_shot_max=None, per_shot_min=1,
+                 mem_guard_bytes=512 * 1024 * 1024, release=None):
+        self.cut_hi = float(cut_hi)
+        pm = per_shot_max if per_shot_max is None else int(per_shot_max)
+        self.per_shot_max = pm if (pm is not None and pm > 0) else None
+        self.per_shot_min = max(1, int(per_shot_min))
+        self.mem_guard = int(mem_guard_bytes)
+        self._release = release
+        self._shot_id = 0
+        self._cur = None          # 当前(未关闭)镜头积累器
+        self.table = []           # 镜头表行 dict 列表(调用方落 CSV)
+        self.shot_map = {}        # 解码帧号 idx → shot_id(note_judged 记账)
+        self._row_by_id = {}      # shot_id → 已关闭镜头表行
+        self._sent_open = {}      # shot_id → 未关闭镜头的已送检帧数
+
+    def _q(self):
+        """配额镜头实际送检帧数: 上限 N 与保底 M 取大(M>N 时配额按 M 执行)。"""
+        return max(self.per_shot_max, self.per_shot_min)
+
+    def _new_shot(self):
+        self._shot_id += 1
+        self._cur = {"id": self._shot_id, "segs": [], "frames": [],
+                     "nsegs": 0, "nframes": 0, "bytes": 0, "fbytes": 0,
+                     "quota": False, "start": None, "end": None}
+
+    def _reselect(self, cur, q):
+        """镜头内重选 top-q(清晰度降序, 平局帧号小者优先), 淘汰帧立即归还。"""
+        frames = cur["frames"]
+        if len(frames) <= q:
+            return
+        order = sorted(range(len(frames)),
+                       key=lambda i: (-frames[i][1], frames[i][0]))
+        cur["frames"] = [frames[i] for i in order[:q]]
+        drop = [frames[i] for i in order[q:]]
+        if cur["fbytes"]:
+            cur["bytes"] = len(cur["frames"]) * cur["fbytes"]
+        if drop and self._release is not None:
+            self._release([f[2] for f in drop])
+
+    def _activate(self, cur):
+        cur["quota"] = True
+        cur["segs"] = []          # 配额镜头不再逐段送检, 释放段/rep/backups 引用
+        self._reselect(cur, self._q())
+
+    def _close(self, reason):
+        cur = self._cur
+        self._cur = None
+        row = {"shot_id": cur["id"], "seg_count": cur["nsegs"],
+               "frame_start": cur["start"], "frame_end": cur["end"],
+               "frames": cur["nframes"],
+               "sent": self._sent_open.pop(cur["id"], 0),
+               "quota": 1 if cur["quota"] else 0, "close_reason": reason}
+        self.table.append(row)
+        self._row_by_id[cur["id"]] = row
+        if cur["quota"]:
+            sel = sorted(cur["frames"], key=lambda f: f[0])   # 送检按时间序
+            return {"kind": "shot", "quota": True, "shot_id": cur["id"],
+                    "nsegs": cur["nsegs"], "sel": [(f[0], f[2]) for f in sel],
+                    "nbytes": len(sel) * cur["fbytes"], "row": row,
+                    "release": [f[2] for f in sel]}
+        return {"kind": "shot", "quota": False, "shot_id": cur["id"],
+                "nsegs": cur["nsegs"], "segs": cur["segs"],
+                "topup": [(f[0], f[2]) for f in cur["frames"]],
+                "min": self.per_shot_min, "nbytes": cur["bytes"], "row": row,
+                "release": [f[2] for f in cur["frames"]]}
+
+    def add_segment(self, seg, frames=None):
+        """推入一个已关闭段。seg=(rep, rep_idx, backups, meta)(两臂同构);
+        frames=meta['frames']([(idx, sharp, ref), ...] 清晰度降序)或 None
+        (纯记录模式)。返回因本段而关闭的镜头工作项列表(0/1 个)。"""
+        meta = seg[3]
+        items = []
+        if self._cur is None:
+            self._new_shot()
+        elif meta["rows"][0][1] >= self.cut_hi:
+            # 本段首帧 diff>=cut_hi ⟺ 上一次关段是硬切 → 镜头边界
+            items.append(self._close("cut"))
+            self._new_shot()
+        cur = self._cur
+        cur["nsegs"] += 1
+        cur["nframes"] += len(meta["rows"])
+        if cur["start"] is None:
+            cur["start"] = meta["seg_start"]
+        cur["end"] = meta["seg_end"]
+        sid = cur["id"]
+        for r in meta["rows"]:
+            self.shot_map[r[0]] = sid
+        if frames is None:
+            return items          # 纯记录模式: 不持任何 seg/meta/帧引用
+        cur["segs"].append(seg)   # 配额激活前需保留段元组(非配额镜头逐段送检)
+        cur["frames"].extend(frames)
+        n = max(1, len(meta["rows"]))
+        cur["fbytes"] = meta["nbytes_total"] // n   # 帧全同尺寸, 取均值即精确值
+        cur["bytes"] += meta["nbytes_total"]
+        if self.per_shot_max is not None:
+            if not cur["quota"]:
+                if cur["nsegs"] > self.per_shot_max:
+                    self._activate(cur)          # 段数超上限 → 配额生效
+            else:
+                self._reselect(cur, self._q())   # 运行中维持 top-q
+        if cur["bytes"] > self.mem_guard:
+            if self.per_shot_max is not None:
+                if not cur["quota"]:
+                    self._activate(cur)          # 护栏: 立即缩到 q 帧
+            elif cur["segs"]:
+                # 仅 min 模式无配额可用 → 强制关镜头防爆内存
+                items.append(self._close("memcap"))
+        return items
+
+    def close_eof(self):
+        """EOF: 强制关闭当前镜头(close_reason=eof), 返回工作项列表(0/1 个)。"""
+        if self._cur is not None:
+            return [self._close("eof")]
+        return []
+
+    def note_judged(self, idx):
+        """闸门每判一帧记账一次(送检口径, 含补判); 由调用方 _judge_and_write
+        调用。镜头未关闭时先挂账, 关闭时并入表行。"""
+        sid = self.shot_map.get(idx)
+        if sid is None:
+            return
+        row = self._row_by_id.get(sid)
+        if row is not None:
+            row["sent"] += 1
+        else:
+            self._sent_open[sid] = self._sent_open.get(sid, 0) + 1
+
+
 class SlotSegDeduper(FrameDedupSelector):
     """显存槽号版段状态机 —— 与 FrameDedupSelector 的分段/选帧决策【逐行同构】,
     供 --decode pynvvc-gpu --dedup 零拷贝臂使用。

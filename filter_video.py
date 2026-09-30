@@ -66,7 +66,7 @@ import cv2
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.face_det import SCRFDTRTDetector, estimate_pose
 from src.face_pose68 import FacePose68
-from src.frame_dedup import FrameDedupSelector
+from src.frame_dedup import FrameDedupSelector, ShotTracker
 
 
 # ---------------- helpers ----------------
@@ -579,8 +579,10 @@ class VideoFilter:
                  gaze_pitch_max=15.0, gaze_yaw_max=15.0,
                  head_on=True, head_conf=0.30, head_model_path=None,
                  dedup=False, dedup_cut_lo=2.0, dedup_cut_hi=10.0,
-                 dedup_min_seg=2, dedup_max_seg=10, dedup_thumb=128,
+                 dedup_min_seg=2, dedup_max_seg=None, dedup_thumb=128,
                  dedup_sharp_side=256, dedup_backups=2, dedup_max_mem=48.0,
+                 dedup_per_shot_max=None, dedup_per_shot_min=1,
+                 dedup_max_gap_sec=1.0,
                  hw_decode=True, decode_mode="auto",
                  pipeline=True, pipeline_depth=16, head_batch=True,
                  head_letterbox_workers=8, overlap="auto"):
@@ -657,11 +659,33 @@ class VideoFilter:
         self.dedup_cut_lo = dedup_cut_lo
         self.dedup_cut_hi = dedup_cut_hi
         self.dedup_min_seg = dedup_min_seg
-        self.dedup_max_seg = dedup_max_seg
+        # 段长时间兜底: dedup_max_seg=None(默认)→按 --dedup-max-gap-sec 换算
+        # (_dedup_eff_max_seg); 显式给定帧数则优先旧口径
+        self.dedup_max_seg = (int(dedup_max_seg)
+                              if dedup_max_seg and int(dedup_max_seg) > 0
+                              else None)
+        if self.dedup and self.dedup_max_seg is None and not (
+                dedup_max_gap_sec and float(dedup_max_gap_sec) > 0):
+            raise ValueError("--dedup-max-gap-sec 必须 > 0"
+                             "(或显式给 --dedup-max-seg)")
         self.dedup_thumb = dedup_thumb
         self.dedup_sharp_side = dedup_sharp_side
         self.dedup_backups = dedup_backups
         self.dedup_max_mem = dedup_max_mem
+        # 镜头感知采样(opt-in, 默认全关=旧行为): 硬切(diff>=cut_hi)为镜头边界;
+        # per_shot_max=镜头内送检配额上限(None=关, 逐段送检旧行为);
+        # per_shot_min=每镜头至少 M 帧送检(1=旧逐段 rep 机制天然满足);
+        # max_gap_sec=段长时间兜底间隔(秒), 按 dec_fps 换算 max_seg
+        _psm = (dedup_per_shot_max if dedup_per_shot_max is None
+                else int(dedup_per_shot_max))
+        self.dedup_per_shot_max = _psm if (_psm is not None and _psm > 0) else None
+        self.dedup_per_shot_min = max(1, int(dedup_per_shot_min))
+        self.dedup_max_gap_sec = float(dedup_max_gap_sec)
+        if (self.dedup_per_shot_max is not None
+                and self.dedup_per_shot_min > self.dedup_per_shot_max):
+            print(f"[filter] WARNING: --dedup-per-shot-min({self.dedup_per_shot_min}) "
+                  f"> --dedup-per-shot-max({self.dedup_per_shot_max}), "
+                  f"配额镜头按 q=max(N,M)={self.dedup_per_shot_min} 帧送检")
         # NVDEC GPU 硬解（--hw-decode，默认开）：dec_cmd 在 -i 前插 -hwaccel cuda；
         # 硬解失败（ffmpeg 非 0 退出/异常）自动回退 CPU 软解重跑一次
         self.hw_decode = hw_decode
@@ -906,6 +930,17 @@ class VideoFilter:
                   flush=True)
             return "cpu-fallback"
 
+    def _dedup_eff_max_seg(self, dec_fps):
+        """段长时间兜底上限(帧)。显式 --dedup-max-seg 优先(旧裸帧数口径);
+        否则按保底间隔换算 max(min_seg, round(max_gap_sec * dec_fps)) ——
+        dec_fps=实际送检帧率(源>max-fps 时=max-fps, 否则=源 fps; pynvvc 表外
+        帧率回退管道臂同样先按 max-fps 降采样后再判)。默认 1.0s@10fps=10 帧,
+        与旧硬编码 dedup_max_seg=10@10fps 逐位一致。"""
+        if self.dedup_max_seg:
+            return self.dedup_max_seg
+        sf = dec_fps if (dec_fps and dec_fps > 0) else 10.0
+        return max(self.dedup_min_seg, int(round(self.dedup_max_gap_sec * sf)))
+
     def process(self, video_path, out_dir, yaw_lim, shared_csv=False):
         self.yaw_lim = yaw_lim
         w, h, fps, nframes = probe(video_path)
@@ -1038,7 +1073,8 @@ class VideoFilter:
         dedup_rows = []   # (frame, diff, seg_id, seg_start, seg_end, sharp, is_rep)
         seg_stats = {"segs": 0, "sent": 0, "reps": 0, "bk_judged": 0,
                      "sec_judged": 0, "sec_hits": 0,
-                     "drop_seg": 0, "backup_hits": 0}
+                     "drop_seg": 0, "backup_hits": 0,
+                     "quota_shots": 0, "quota_sent": 0, "min_judged": 0}
         dedup_dy_hits = 0
         try:
             if use_pynvvc:
@@ -1060,11 +1096,36 @@ class VideoFilter:
                 # 输出文件名仍用【原始解码帧号】。
                 deduper = FrameDedupSelector(
                     cut_lo=self.dedup_cut_lo, cut_hi=self.dedup_cut_hi,
-                    min_seg=self.dedup_min_seg, max_seg=self.dedup_max_seg,
+                    min_seg=self.dedup_min_seg,
+                    max_seg=self._dedup_eff_max_seg(dec_fps),
                     thumb_side=self.dedup_thumb,
                     sharp_side=self.dedup_sharp_side,
                     n_backups=self.dedup_backups,
                     max_mem_mb=self.dedup_max_mem)
+                # ---- 镜头感知采样(opt-in, 见 src/frame_dedup.py ShotTracker) ----
+                # shot_mode=True(给了 --dedup-per-shot-max 或 --dedup-per-shot-min>1)
+                # 才改变送检流(段→镜头工作项); 默认只记镜头表+sent 记账, 逐字节零影响。
+                shot_mode = (self.dedup_per_shot_max is not None
+                             or self.dedup_per_shot_min > 1)
+                _fb = size                      # 全分辨率帧字节(护栏估算用)
+                _eff = self._dedup_eff_max_seg(dec_fps)
+                if _fb * _eff > self.dedup_max_mem * 1024 * 1024:
+                    _eff = max(self.dedup_min_seg,
+                               int(self.dedup_max_mem * 1024 * 1024) // _fb)
+                _q = (max(self.dedup_per_shot_max, self.dedup_per_shot_min)
+                      if self.dedup_per_shot_max is not None else 0)
+                # 镜头缓冲护栏: 至少 512MB; 配额模式下保证配额激活前峰值
+                # ((N+1) 段)放得下, 上限 1GB
+                _need = ((self.dedup_per_shot_max + 1) * _eff + _q) * _fb \
+                    if self.dedup_per_shot_max is not None else 0
+                _guard = max(512 * 1024 * 1024, min(_need + 64 * 1024 * 1024,
+                                                    1024 * 1024 * 1024))
+                tracker = ShotTracker(
+                    self.dedup_cut_hi,
+                    per_shot_max=self.dedup_per_shot_max,
+                    per_shot_min=self.dedup_per_shot_min,
+                    mem_guard_bytes=_guard)
+                _cur_judged = [None]   # 当前镜头工作项的已判帧号集(top-up 去重用)
                 segs = []   # 已关闭待送检段: (rep_frame, rep_idx, backups, meta)
                 SEG_Q_CAP = max(8, self.detect_chunk // 4)
                 SEG_Q_BYTES = 160 * 1024 * 1024  # 挂起段(全段帧)内存上限
@@ -1154,6 +1215,11 @@ class VideoFilter:
                     t_gaze += _tg
                     t_head += _th
                     frame_no += 1   # dedup 模式下 = 送检帧数(reps + backup 补判)
+                    # 镜头感知: 按帧号给镜头表记账 sent(纯记账, 不影响判定)
+                    if tracker is not None:
+                        tracker.note_judged(idx)
+                        if _cur_judged[0] is not None:
+                            _cur_judged[0].add(idx)
                     yaw, pitch, roll = pose
                     if self.score_name:
                         report.append([idx, verdict, score, yaw, pitch,
@@ -1250,11 +1316,66 @@ class VideoFilter:
                         if kind == "scan" and job_pos not in solved_scan:
                             seg_stats["drop_seg"] += 1
 
+                def _process_shot_item(item):
+                    """镜头工作项处理(仅 shot_mode; 复用同一套闸门链):
+                    - 配额镜头(quota=True): 镜头内 top-q 帧(时间序)批量送检,
+                      逐帧过完整闸门链(闸门零改动)。全 drop 不再补判 —— 淘汰帧
+                      已按配额即时释放(内存有界), 送检 q>=M 已满足送检保底。
+                    - 非配额镜头: 原逐段流(_process_seg_batch 原样), 之后若
+                      per-shot-min=M>1 且该镜头送检数<M, 按「段内回退序」
+                      (逐段时间序、段内清晰度降序, 即 rep 被 drop 时的既有
+                      回退序)对未判过的帧逐帧补判至 M 帧送检。"""
+                    _cur_judged[0] = set()
+                    try:
+                        seg_stats["segs"] += item["nsegs"]
+                        if item["quota"]:
+                            seg_stats["quota_shots"] += 1
+                            sel = item["sel"]
+                            dets, kpss, pose_map = _detect_batch(
+                                [fr for (_idx, fr) in sel])
+                            for si, (idx, fr) in enumerate(sel):
+                                seg_stats["sent"] += 1
+                                seg_stats["quota_sent"] += 1
+                                _judge_and_write(fr, idx, dets[si], kpss[si],
+                                                 pose_map.get(si))
+                        else:
+                            _process_seg_batch(item["segs"])
+                            if item["min"] > 1:
+                                row = item["row"]
+                                pool = item["topup"]
+                                ji = 0
+                                while (row["sent"] < item["min"]
+                                       and ji < len(pool)):
+                                    idx, fr = pool[ji]
+                                    ji += 1
+                                    if idx in _cur_judged[0]:
+                                        continue   # 已判过(rep/sec/scan 补判)
+                                    d1, k1, p1 = _detect_batch([fr])
+                                    seg_stats["sent"] += 1
+                                    seg_stats["min_judged"] += 1
+                                    _judge_and_write(fr, idx, d1[0], k1[0],
+                                                     p1.get(0))
+                    finally:
+                        _cur_judged[0] = None
+
+                def _pending_bytes():
+                    # 挂起队列字节: shot_mode 用工作项自带字节, 原路径按段 meta
+                    if shot_mode:
+                        return sum(s["nbytes"] for s in segs)
+                    return sum(s[3]["nbytes_total"] for s in segs)
+
+                def _process_items(batch):
+                    if shot_mode:
+                        for it in batch:
+                            _process_shot_item(it)
+                    else:
+                        _process_seg_batch(batch)   # 原路径原样(逐段批送检)
+
                 def _drain_segs():
                     while (len(segs) >= SEG_Q_CAP
-                           or sum(s[3]["nbytes_total"] for s in segs) > SEG_Q_BYTES):
+                           or _pending_bytes() > SEG_Q_BYTES):
                         n = min(len(segs), self.detect_chunk)
-                        _process_seg_batch(segs[:n])
+                        _process_items(segs[:n])
                         del segs[:n]
 
                 with (f_src if f_src is not None
@@ -1275,7 +1396,15 @@ class VideoFilter:
                             res = deduper.push(fr, decoded_frames)
                             if res is not None:
                                 rep_fr, rep_idx, backups, meta = res
-                                segs.append((rep_fr, rep_idx, backups, meta))
+                                _seg = (rep_fr, rep_idx, backups, meta)
+                                if shot_mode:
+                                    # 镜头工作项替代裸段入队(配额/保底 opt-in)
+                                    for it in tracker.add_segment(
+                                            _seg, meta["frames"]):
+                                        segs.append(it)
+                                else:
+                                    tracker.add_segment(_seg)   # 纯记录镜头表
+                                    segs.append(_seg)
                                 for (fi, dif, sh, isrep) in meta["rows"]:
                                     dedup_rows.append(
                                         (fi, dif, meta["seg_id"],
@@ -1285,17 +1414,26 @@ class VideoFilter:
                     res = deduper.flush()   # EOF 强关最后一段
                     if res is not None:
                         rep_fr, rep_idx, backups, meta = res
-                        segs.append((rep_fr, rep_idx, backups, meta))
+                        _seg = (rep_fr, rep_idx, backups, meta)
+                        if shot_mode:
+                            for it in tracker.add_segment(_seg, meta["frames"]):
+                                segs.append(it)
+                        else:
+                            tracker.add_segment(_seg)
+                            segs.append(_seg)
                         for (fi, dif, sh, isrep) in meta["rows"]:
                             dedup_rows.append(
                                 (fi, dif, meta["seg_id"],
                                  meta["seg_start"], meta["seg_end"],
                                  sh, isrep))
+                    items = tracker.close_eof()   # EOF 关最后一镜头(被动模式仅记表)
+                    if shot_mode:
+                        segs.extend(items)
                     # 排空剩余段：EOF 后不再依赖触发条件，否则尾部不满阈值
                     # 的段会永远留在队列里不被送检(丢帧/丢秒)
                     while segs:
                         n = min(len(segs), self.detect_chunk)
-                        _process_seg_batch(segs[:n])
+                        _process_items(segs[:n])
                         del segs[:n]
             else:
                 with (f_src if f_src is not None
@@ -1529,6 +1667,22 @@ class VideoFilter:
                     dfh.write("frame,diff,seg_id,seg_start,seg_end,sharp,is_rep\n")
                     for (fi, dif, sid, s0, s1, sh, isrep) in dedup_rows:
                         dfh.write(f"{fi},{dif:.3f},{sid},{s0},{s1},{sh:.1f},{isrep}\n")
+            if tracker is not None and tracker.table:
+                # 镜头表(镜头感知采样, --dedup 即产出): 镜头号/段数/起止帧/帧数/
+                # 送检帧数/是否配额镜头/关闭原因(cut=硬切, eof, memcap=护栏强关)。
+                # 命名规则与 dedup_report 相同: 批处理 <stem>_shot_table.csv,
+                # 单视频 shot_table.csv。
+                _sname = (f"{stem}_shot_table.csv" if shared_csv
+                          else "shot_table.csv")
+                with open(os.path.join(out_dir, _sname), "w",
+                          encoding="utf-8") as sfh:
+                    sfh.write("shot_id,seg_count,frame_start,frame_end,frames,"
+                              "sent,quota,close_reason\n")
+                    for r in tracker.table:
+                        sfh.write(f"{r['shot_id']},{r['seg_count']},"
+                                  f"{r['frame_start']},{r['frame_end']},"
+                                  f"{r['frames']},{r['sent']},{r['quota']},"
+                                  f"{r['close_reason']}\n")
         finally:
             if f_src is not None:
                 f_src.close()
@@ -1558,6 +1712,11 @@ class VideoFilter:
               f"detect={t_det:5.2f}s  judge={t_judge:5.2f}s  gaze={t_gaze:5.2f}s  "
               f"head={t_head:5.2f}s  imwrite={t_write:5.2f}s ({kept} frames)")
         if self.dedup:
+            _qtail = (f"  quota-shots={seg_stats['quota_shots']}  "
+                      f"quota-sent={seg_stats['quota_sent']}  "
+                      f"min-judged={seg_stats['min_judged']}"
+                      if seg_stats["quota_shots"] or seg_stats["min_judged"]
+                      else "")
             print(f"    [dedup] segments={seg_stats['segs']}  "
                   f"reps={seg_stats['reps']}  "
                   f"backup-judged={seg_stats['bk_judged']}  "
@@ -1566,7 +1725,8 @@ class VideoFilter:
                   f"sec-hit={seg_stats['sec_hits']}  "
                   f"drop_seg={seg_stats['drop_seg']}  "
                   f"compression={decoded_frames / max(frame_no, 1):.2f}x  "
-                  f"dy-gate-hits(dedup kept)={dedup_dy_hits}")
+                  f"dy-gate-hits(dedup kept)={dedup_dy_hits}"
+                  f"{_qtail}")
         out = {"frames": frame_no, "kept": kept, "no_face": drop_noface,
                "decode_mode": dec_mode,
                "pose": drop_pose, "down": drop_down, "multi": drop_multi,
@@ -2113,7 +2273,7 @@ class VideoFilter:
         import heapq
         import pycuda.driver as _drv
         from pycuda.gpuarray import GPUArray
-        from src.frame_dedup import SlotSegDeduper
+        from src.frame_dedup import SlotSegDeduper, ShotTracker
         from src.gpu_decode import (AreaTables, DeviceFramePool, OVL_SETS,
                                     _OverlappedGpuSource, _PynvvcGpuSource,
                                     scrfd_block_detect)
@@ -2182,7 +2342,7 @@ class VideoFilter:
             # 挂起段可跨块存活, 故用分配器复用而非游标回绕 —— 回绕会覆写
             # 尚未送检的挂起段帧) + 本块帧数 + 段内上限 + 余量。
             fb = h * w * 3
-            eff_max_est = self.dedup_max_seg
+            eff_max_est = self._dedup_eff_max_seg(dec_fps)
             if fb * eff_max_est > self.dedup_max_mem * 1024 * 1024:
                 eff_max_est = max(self.dedup_min_seg,
                                   int(self.dedup_max_mem * 1024 * 1024) // fb)
@@ -2190,7 +2350,22 @@ class VideoFilter:
             SEG_Q_BYTES = 160 * 1024 * 1024
             left_frames = min((SEG_Q_CAP - 1) * eff_max_est,
                               SEG_Q_BYTES // fb)
-            stage_cap = left_frames + self.detect_chunk + eff_max_est + 8
+            # 镜头感知采样(opt-in): shot_mode=配额/保底开启才改变送检流;
+            # 驻留池需额外容纳镜头缓冲(配额激活前峰值 (N+1) 段 + q 帧, 与宿主臂
+            # 同一护栏公式; 纯记录模式不持帧不加分)
+            shot_mode = (self.dedup_per_shot_max is not None
+                         or self.dedup_per_shot_min > 1)
+            _q = (max(self.dedup_per_shot_max, self.dedup_per_shot_min)
+                  if self.dedup_per_shot_max is not None else 0)
+            _need = ((self.dedup_per_shot_max + 1) * eff_max_est + _q) * fb \
+                if self.dedup_per_shot_max is not None else 0
+            _guard = max(512 * 1024 * 1024,
+                         min(_need + 64 * 1024 * 1024, 1024 * 1024 * 1024))
+            shot_cap = (min(_guard // fb,
+                            (self.dedup_per_shot_max + 2) * eff_max_est + _q + 8)
+                        if shot_mode else 0)
+            stage_cap = left_frames + self.detect_chunk + eff_max_est + 8 \
+                + shot_cap
             if stage_cap * fb > 3 * 1024 * 1024 * 1024:
                 raise _PynvvcDecodeError(
                     f"dedup 显存驻留池超预算"
@@ -2209,7 +2384,8 @@ class VideoFilter:
             # 段状态机(与宿主 FrameDedupSelector 逐行同构, 槽号版)
             deduper = SlotSegDeduper(
                 cut_lo=self.dedup_cut_lo, cut_hi=self.dedup_cut_hi,
-                min_seg=self.dedup_min_seg, max_seg=self.dedup_max_seg,
+                min_seg=self.dedup_min_seg,
+                max_seg=self._dedup_eff_max_seg(dec_fps),
                 thumb_side=self.dedup_thumb,
                 sharp_side=self.dedup_sharp_side,
                 n_backups=self.dedup_backups,
@@ -2244,13 +2420,15 @@ class VideoFilter:
         dedup_rows = []   # (frame, diff, seg_id, seg_start, seg_end, sharp, is_rep)
         seg_stats = {"segs": 0, "sent": 0, "reps": 0, "bk_judged": 0,
                      "sec_judged": 0, "sec_hits": 0,
-                     "drop_seg": 0, "backup_hits": 0}
+                     "drop_seg": 0, "backup_hits": 0,
+                     "quota_shots": 0, "quota_sent": 0, "min_judged": 0}
         dedup_dy_hits = 0
         try:
             dec_mode = "pynvvc-gpu"
             t_dec = 0.0
             sec_fps = dec_fps if (dec_fps and dec_fps > 0) else 10.0
             segs = []   # 已关闭待送检段: (rep_slot, rep_idx, backups, meta)
+            _cur_judged = [None]   # 当前镜头工作项已判帧号集(top-up 去重用)
 
             # ---- 驻留池槽分配器(最低自由槽优先, 确定性复用) ----
             free_slots = []
@@ -2269,6 +2447,14 @@ class VideoFilter:
             def _stage_release(slots):
                 for s in slots:
                     heapq.heappush(free_slots, s)
+
+            # 镜头感知采样记账器(opt-in): 配额激活淘汰帧 → 槽位即时归还驻留池;
+            # 纯记录模式(默认参数)只记镜头表, 不改变送检流
+            tracker = ShotTracker(
+                self.dedup_cut_hi,
+                per_shot_max=self.dedup_per_shot_max,
+                per_shot_min=self.dedup_per_shot_min,
+                mem_guard_bytes=_guard, release=_stage_release)
 
             def _count_drop(vd):
                 nonlocal drop_noface, drop_pose, drop_down, drop_multi
@@ -2386,6 +2572,11 @@ class VideoFilter:
                         if nheads >= 2:
                             verdict = "multi_head"
                 frame_no += 1   # = 送检帧数(reps + backup 补判)
+                # 镜头感知: 按帧号给镜头表记账 sent(纯记账, 不影响判定)
+                if tracker is not None:
+                    tracker.note_judged(idx)
+                    if _cur_judged[0] is not None:
+                        _cur_judged[0].add(idx)
                 yaw, pitch, roll = pose
                 if self.score_name:
                     report.append([idx, verdict, score, yaw, pitch,
@@ -2412,9 +2603,11 @@ class VideoFilter:
                     print(f"    #{idx:05d} drop  ({verdict}  down={down})")
                 return False
 
-            def _process_seg_batch(sb):
+            def _process_seg_batch(sb, do_release=True):
                 """与 _run_pass dedup 分支 _process_seg_batch 逐行同逻辑(段批
-                rep 送检→闸门→sec/scan 补判 early-stop), 帧来源改驻留池槽。"""
+                rep 送检→闸门→sec/scan 补判 early-stop), 帧来源改驻留池槽。
+                do_release=False: 槽位归还交由调用方(镜头工作项统一归还一次,
+                防同槽双重归还)。"""
                 seg_stats["segs"] += len(sb)
                 rep_slots = [s[0] for s in sb]
                 dets, kpss = _detect_slots(rep_slots)
@@ -2479,14 +2672,77 @@ class VideoFilter:
                         seg_stats["drop_seg"] += 1
                 # 本批全部送检完成 → 段内全部驻留槽归还(meta['frames'] 覆盖
                 # 全段帧, 含 rep/backups)
-                for seg in sb:
-                    _stage_release([sl for (_idx, _sh, sl) in seg[3]["frames"]])
+                if do_release:
+                    for seg in sb:
+                        _stage_release([sl for (_idx, _sh, sl) in seg[3]["frames"]])
+
+            def _process_shot_item(item):
+                """镜头工作项处理(仅 shot_mode; 与宿主臂 _process_shot_item
+                逐行同逻辑, 帧来源改驻留池槽):
+                - 配额镜头: 镜头内 top-q 槽(时间序)批量送检, 逐帧过完整闸门链;
+                  全 drop 不再补判(淘汰槽已按配额即时归还, 显存有界)。
+                - 非配额镜头: 原逐段流, 之后 per-shot-min=M>1 时按段内回退序
+                  对未判过的槽补判至 M 帧送检。
+                处理完统一归还 item['release'](各槽恰归还一次)。"""
+                _cur_judged[0] = set()
+                try:
+                    seg_stats["segs"] += item["nsegs"]
+                    if item["quota"]:
+                        seg_stats["quota_shots"] += 1
+                        sel = item["sel"]
+                        slots = [sl for (_idx, sl) in sel]
+                        dets, kpss = _detect_slots(slots)
+                        items_f, sel_frames = _face_land(slots, dets)
+                        pose_map = _pose_batch(items_f)
+                        for si, (idx, _sl) in enumerate(sel):
+                            seg_stats["sent"] += 1
+                            seg_stats["quota_sent"] += 1
+                            _judge_and_write(sel_frames.get(si), idx,
+                                             dets[si], kpss[si],
+                                             pose_map.get(si))
+                    else:
+                        _process_seg_batch(item["segs"], do_release=False)
+                        if item["min"] > 1:
+                            row = item["row"]
+                            pool = item["topup"]
+                            ji = 0
+                            while (row["sent"] < item["min"]
+                                   and ji < len(pool)):
+                                idx, sl = pool[ji]
+                                ji += 1
+                                if idx in _cur_judged[0]:
+                                    continue   # 已判过(rep/sec/scan 补判)
+                                d1, k1 = _detect_slots([sl])
+                                items_f, fr_map = _face_land([sl], d1)
+                                pose_map = _pose_batch(items_f)
+                                seg_stats["sent"] += 1
+                                seg_stats["min_judged"] += 1
+                                _judge_and_write(fr_map.get(0), idx,
+                                                 d1[0], k1[0], pose_map.get(0))
+                    # 本镜头全部送检完成 → 统一归还槽位(淘汰槽已在配额激活/
+                    # 重选时提前归还, 不在本清单内)
+                    _stage_release(item["release"])
+                finally:
+                    _cur_judged[0] = None
+
+            def _pending_bytes():
+                # 挂起队列字节: shot_mode 用工作项自带字节, 原路径按段 meta
+                if shot_mode:
+                    return sum(s["nbytes"] for s in segs)
+                return sum(s[3]["nbytes_total"] for s in segs)
+
+            def _process_items(batch):
+                if shot_mode:
+                    for it in batch:
+                        _process_shot_item(it)
+                else:
+                    _process_seg_batch(batch)   # 原路径原样(逐段批送检)
 
             def _drain_segs():
                 while (len(segs) >= SEG_Q_CAP
-                       or sum(s[3]["nbytes_total"] for s in segs) > SEG_Q_BYTES):
+                       or _pending_bytes() > SEG_Q_BYTES):
                     n = min(len(segs), self.detect_chunk)
-                    _process_seg_batch(segs[:n])
+                    _process_items(segs[:n])
                     del segs[:n]
 
             while True:
@@ -2529,7 +2785,14 @@ class VideoFilter:
                     res = deduper.push_slot(tv, sv, fb, sl, decoded_frames)
                     if res is not None:
                         rep_sl, rep_idx, backups, meta = res
-                        segs.append((rep_sl, rep_idx, backups, meta))
+                        _seg = (rep_sl, rep_idx, backups, meta)
+                        if shot_mode:
+                            # 镜头工作项替代裸段入队(配额/保底 opt-in)
+                            for it in tracker.add_segment(_seg, meta["frames"]):
+                                segs.append(it)
+                        else:
+                            tracker.add_segment(_seg)   # 纯记录镜头表
+                            segs.append(_seg)
                         for (fi, dif, sh, isrep) in meta["rows"]:
                             dedup_rows.append(
                                 (fi, dif, meta["seg_id"],
@@ -2544,15 +2807,24 @@ class VideoFilter:
             res = deduper.flush()   # EOF 强关最后一段
             if res is not None:
                 rep_sl, rep_idx, backups, meta = res
-                segs.append((rep_sl, rep_idx, backups, meta))
+                _seg = (rep_sl, rep_idx, backups, meta)
+                if shot_mode:
+                    for it in tracker.add_segment(_seg, meta["frames"]):
+                        segs.append(it)
+                else:
+                    tracker.add_segment(_seg)
+                    segs.append(_seg)
                 for (fi, dif, sh, isrep) in meta["rows"]:
                     dedup_rows.append(
                         (fi, dif, meta["seg_id"],
                          meta["seg_start"], meta["seg_end"], sh, isrep))
+            items = tracker.close_eof()   # EOF 关最后一镜头(被动模式仅记表)
+            if shot_mode:
+                segs.extend(items)
             # 排空剩余段(EOF 后不再依赖触发条件; 与宿主臂同口径)
             while segs:
                 n = min(len(segs), self.detect_chunk)
-                _process_seg_batch(segs[:n])
+                _process_items(segs[:n])
                 del segs[:n]
 
             # NVDEC 拉帧+D2D 等待(read_block 内部累计)计入 decode 段
@@ -2609,6 +2881,20 @@ class VideoFilter:
                     dfh.write("frame,diff,seg_id,seg_start,seg_end,sharp,is_rep\n")
                     for (fi, dif, sid, s0, s1, sh, isrep) in dedup_rows:
                         dfh.write(f"{fi},{dif:.3f},{sid},{s0},{s1},{sh:.1f},{isrep}\n")
+            if tracker is not None and tracker.table:
+                # 镜头表(--dedup 即产出; 与宿主臂同款): 批处理 <stem>_shot_table.csv,
+                # 单视频 shot_table.csv
+                _sname = (f"{stem}_shot_table.csv" if shared_csv
+                          else "shot_table.csv")
+                with open(os.path.join(out_dir, _sname), "w",
+                          encoding="utf-8") as sfh:
+                    sfh.write("shot_id,seg_count,frame_start,frame_end,frames,"
+                              "sent,quota,close_reason\n")
+                    for r in tracker.table:
+                        sfh.write(f"{r['shot_id']},{r['seg_count']},"
+                                  f"{r['frame_start']},{r['frame_end']},"
+                                  f"{r['frames']},{r['sent']},{r['quota']},"
+                                  f"{r['close_reason']}\n")
         finally:
             src.close()
             ex.shutdown(wait=True)
@@ -2635,7 +2921,11 @@ class VideoFilter:
               f"sec-hit={seg_stats['sec_hits']}  "
               f"drop_seg={seg_stats['drop_seg']}  "
               f"compression={decoded_frames / max(frame_no, 1):.2f}x  "
-              f"dy-gate-hits(dedup kept)={dedup_dy_hits}")
+              f"dy-gate-hits(dedup kept)={dedup_dy_hits}"
+              + (f"  quota-shots={seg_stats['quota_shots']}  "
+                 f"quota-sent={seg_stats['quota_sent']}  "
+                 f"min-judged={seg_stats['min_judged']}"
+                 if seg_stats["quota_shots"] or seg_stats["min_judged"] else ""))
         out = {"frames": frame_no, "kept": kept, "no_face": drop_noface,
                "decode_mode": dec_mode,
                "pose": drop_pose, "down": drop_down, "multi": drop_multi,
@@ -2867,6 +3157,39 @@ def merge_dedup_reports(out_dir, video_files):
     return total, merged
 
 
+def merge_shot_tables(out_dir, video_files):
+    """目录批处理模式收尾: 把 out_dir 内逐视频 <stem>_shot_table.csv 合并为
+    shot_table_all.csv —— 风格与 merge_dedup_reports 一致(首列 video,
+    行原样前缀, 合并后删除源 CSV)。--dedup 未产出镜头表的视频跳过(静默)。
+    返回 (镜头行数, 成功合并的视频数)。"""
+    header = ["video", "shot_id", "seg_count", "frame_start", "frame_end",
+              "frames", "sent", "quota", "close_reason"]
+    src_header = ",".join(header[1:])
+    total = merged = 0
+    all_path = os.path.join(out_dir, "shot_table_all.csv")
+    with open(all_path, "w", encoding="utf-8") as f:
+        f.write(",".join(header) + "\n")
+        for fn in video_files:
+            stem = os.path.splitext(fn)[0]
+            src = os.path.join(out_dir, f"{stem}_shot_table.csv")
+            if not os.path.isfile(src):
+                continue
+            with open(src, encoding="utf-8") as sf:
+                lines = [ln for ln in sf.read().splitlines() if ln]
+            if not lines or lines[0] != src_header:
+                print(f"  WARNING: {src} 表头异常, 跳过")
+                continue
+            f.write("\n".join(f"{fn},{ln}" for ln in lines[1:]))
+            f.write("\n")
+            total += len(lines) - 1
+            merged += 1
+            os.remove(src)
+    if merged:
+        print(f"  [merge] 镜头表 {merged}/{len(video_files)} 视频 -> "
+              f"{all_path} ({total} 镜头), 源 <stem>_shot_table.csv 已并入删除")
+    return total, merged
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Filter a video to high-quality face frames (JPG), no re-encode.",
@@ -3015,8 +3338,24 @@ def main():
                          "逐帧独立成段不漏帧)")
     ap.add_argument("--dedup-min-seg", type=int, default=2,
                     help="dedup 最小段长(帧), 低于此长度 diff>=cut_lo 不关段(防闪烁)")
-    ap.add_argument("--dedup-max-seg", type=int, default=10,
-                    help="dedup 段最大帧数(10fps 下 10=1s 兜底: 全程无动作也每秒出 1 帧)")
+    ap.add_argument("--dedup-max-seg", type=int, default=None,
+                    help="dedup 段最大帧数(旧裸帧数口径; 默认 None=按 "
+                         "--dedup-max-gap-sec 换算, 显式给定时优先)")
+    ap.add_argument("--dedup-max-gap-sec", type=float, default=1.0,
+                    help="镜头感知采样: 段长时间兜底间隔(秒, 默认 1.0=旧口径 "
+                         "max_seg=10@10fps)。按实际送检帧率换算 "
+                         "max_seg=max(min_seg, round(此值*dec_fps)), off-table "
+                         "fps 回退臂同样正确")
+    ap.add_argument("--dedup-per-shot-max", type=int, default=None,
+                    help="镜头感知采样: 每镜头送检配额上限 N(默认 None=关, "
+                         "逐段送检旧行为)。硬切(diff>=cut_hi)视为镜头边界, "
+                         "软切(diff>=cut_lo)为镜头内次级边界; 镜头内段数>N 时"
+                         "不再逐段送检, 镜头内全部候选帧按清晰度排序只送最清晰 "
+                         "q=max(N,--dedup-per-shot-min) 帧(仍逐帧过闸门)")
+    ap.add_argument("--dedup-per-shot-min", type=int, default=1,
+                    help="镜头感知采样: 每镜头至少 M 帧送检(默认 1=旧逐段 rep "
+                         "机制天然满足)。M>1 且镜头段数<M 时按段内回退序"
+                         "(逐段时间序、段内清晰度降序)补判至 M 帧")
     ap.add_argument("--dedup-thumb", type=int, default=128,
                     help="dedup diff 用的灰度缩略图长边(px)")
     ap.add_argument("--dedup-sharp-side", type=int, default=256,
@@ -3031,6 +3370,9 @@ def main():
                     help="disable the TEMPORARY score/angle naming (just stem_index.jpg)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+    if (args.dedup and args.dedup_max_seg is None
+            and args.dedup_max_gap_sec <= 0):
+        ap.error("--dedup-max-gap-sec 必须 > 0(或显式给 --dedup-max-seg)")
 
     # ---------------- 图片文件夹模式（只加载 head 闸门, 不碰 SCRFD/pose/gaze） ----------------
     image_dir = args.image_dir
@@ -3154,6 +3496,9 @@ def main():
                      dedup_cut_hi=args.dedup_cut_hi,
                      dedup_min_seg=args.dedup_min_seg,
                      dedup_max_seg=args.dedup_max_seg,
+                     dedup_per_shot_max=args.dedup_per_shot_max,
+                     dedup_per_shot_min=args.dedup_per_shot_min,
+                     dedup_max_gap_sec=args.dedup_max_gap_sec,
                      dedup_thumb=args.dedup_thumb,
                      dedup_sharp_side=args.dedup_sharp_side,
                      dedup_backups=args.dedup_backup,
@@ -3202,6 +3547,8 @@ def main():
         if args.dedup:
             merge_dedup_reports(batch_out,
                                 [os.path.basename(p) for p, _ in targets])
+            merge_shot_tables(batch_out,
+                              [os.path.basename(p) for p, _ in targets])
         total_kept = sum(o["kept"] for _, o in results)
         print(f"\n[目录批处理] done={len(results)} failed={len(failed)} "
               f"kept 合计={total_kept}  总墙钟 {dt:.1f}s  -> "
