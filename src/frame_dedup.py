@@ -307,6 +307,98 @@ class ShotTracker:
             self._sent_open[sid] = self._sent_open.get(sid, 0) + 1
 
 
+class OfRunSampler:
+    """全局运动子区间间隔采样记账器(--dedup-of, opt-in, 默认不实例化)。
+
+    把 OFA 硬件光流逐帧信号的三条件判定(dc>=thr_dc & mr>=thr_mr & mcv<=thr_cv,
+    判定在调用方)给出的【帧级 of_global 标志】流式展宽成「连续 >=min_run 帧」
+    的全局运动子区间(post7/post8 的 in_run3 同口径), 生效的 run 子区间内
+    【段关闭时】不再逐段送 rep, 改按时间间隔取帧送检:
+
+      * push(idx, flag): 帧到达时入账(与 deduper.push 逐帧同序)。连续
+        flag=True 长度首次达到 min_run → run 生效(run_start=连续段首帧),
+        前缀帧(确认前已到的 min_run-1 帧)回溯标记; 之后 flag=True 帧即时
+        标记。flag=False(或 EOF close)时若连续段 >=min_run 则结算 run 行
+        (run_start/run_end/len/pickups)入 runs 表。
+      * seg_pickups(meta): 段关闭时调用。段内全部帧都在生效 run 内
+        (in_run)→ 返回该段取帧帧号列表(按 (idx - run_start) % interval == 0
+        全局对齐取帧, 通常 1-2 帧/段), 调用方据此「只送取帧帧、段内其余帧
+        释放」; 段含任何非 run 帧(或 run 尚未生效)→ 返回 None, 段照常走
+        逐段 rep/补判流。
+      * close(): EOF 收尾最后一个未结算 run(>=min_run 才算), 返回 runs 表。
+
+    与既有机制的相互作用(设计约定, 详见接入处注释):
+      * 分段状态机(FrameDedupSelector/SlotSegDeduper)零改动: diff/关段/rep
+        选择照常, 全 OF 段只是「不送 rep」, 其 rows 照记 dedup_report
+        (is_rep 照常), 帧引用(驻留池槽)除取帧帧外立即归还;
+      * ShotTracker: 全 OF 段走【纯记录】add_segment(seg)(镜头表/shot_map
+        连续完整, 镜头边界=硬切的判定不受影响), 取帧帧送检时经
+        note_judged 记入镜头 sent → 保底 per_shot_min 天然满足; 配额
+        per_shot_max 只作用于非 OF 段的逐段送检流, OF 取帧密度
+        (interval 帧取 1, 默认 0.5s@10fps)本身低于配额密度, 不叠加配额;
+      * 保守方向: run 需 min_run 帧确认, 确认前已关闭的段照常送检 → 每 run
+        相比离线口径最多多送 min_run-1 帧 + 确认前关闭段数(只多不漏)。
+    """
+
+    def __init__(self, min_run=3, interval=5):
+        self.min_run = max(1, int(min_run))
+        self.interval = max(1, int(interval))
+        self._pend = []          # 当前连续 flag=True 帧号(run 确认的滑窗)
+        self._run_start = None   # 已生效 run 的起始帧号(None=当前无生效 run)
+        self._open = None        # 未结算 run 的 pickups 计数容器
+        self._in_run = {}        # idx → True(展宽后; 段关闭判定用)
+        self.runs = []           # 已结算 run 表行(供 of_report.csv)
+
+    def push(self, idx, flag):
+        if not flag:
+            if self._pend:
+                if len(self._pend) >= self.min_run:
+                    self.runs.append({"run_start": self._run_start,
+                                      "run_end": idx - 1,
+                                      "len": idx - self._run_start,
+                                      "pickups": (self._open["pickups"]
+                                                  if self._open else 0)})
+                self._pend = []
+                self._run_start = None
+                self._open = None
+            return
+        self._pend.append(idx)
+        if self._run_start is not None:
+            self._in_run[idx] = True        # run 已生效, 延续帧即时标记
+        elif len(self._pend) >= self.min_run:
+            self._run_start = self._pend[0]  # run 首次生效, 回溯前缀
+            for j in self._pend:
+                self._in_run[j] = True
+            self._open = {"pickups": 0}
+
+    def seg_pickups(self, meta):
+        """段关闭时: 全 OF 段(且 run 生效)→ 取帧帧号列表; 否则 None。"""
+        rows = meta["rows"]
+        if not rows or self._run_start is None:
+            return None
+        for r in rows:
+            if not self._in_run.get(r[0]):
+                return None
+        pk = [r[0] for r in rows
+              if (r[0] - self._run_start) % self.interval == 0]
+        if self._open is not None:
+            self._open["pickups"] += len(pk)
+        return pk
+
+    def close(self):
+        """EOF 收尾最后一个未结算 run(>=min_run 才算); 返回 runs 表。"""
+        if self._pend and len(self._pend) >= self.min_run:
+            self.runs.append({"run_start": self._run_start,
+                              "run_end": self._pend[-1],
+                              "len": self._pend[-1] - self._run_start + 1,
+                              "pickups": (self._open["pickups"]
+                                          if self._open else 0)})
+        self._pend = []
+        self._run_start = None
+        self._open = None
+        return self.runs
+
+
 class SlotSegDeduper(FrameDedupSelector):
     """显存槽号版段状态机 —— 与 FrameDedupSelector 的分段/选帧决策【逐行同构】,
     供 --decode pynvvc-gpu --dedup 零拷贝臂使用。

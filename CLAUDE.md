@@ -18,6 +18,12 @@
 - pip 一律用清华镜像:`-i https://pypi.tuna.tsinghua.edu.cn/simple`。
 - 与用户沟通用**中文**。
 
+## 本机参考资源
+
+- **FFmpeg 7.1.1 完整源码已下载**:`E:\work\FFmpeg-n7.1.1`——需要查 NVIDIA/多媒体相关 API、容器/像素格式定义等参考实现时直接读,勿重新下载调研。
+- **NVIDIA Optical Flow SDK 5.0.7(官方 zip)**:`E:\work\Optical_Flow_SDK_5.0.7.zip`——NVOF2/OFA 硬件光流官方头文件与示例(官方页 developer.nvidia.com/optical-flow-sdk);`nvofapi64.dll` 是驱动自带官方运行库,按官方头文件 ctypes 调用属正规用法。
+- **DeepStream 官方 Python 示例库**:`E:\work\deepstream_python_apps`——含 deepstream-opticalflow 官方示例(flow vectors 直出 numpy;需 DeepStream 运行时)。
+
 ## Nsight Systems(nsys)profiling
 
 凡涉及 nsys / profiling / GPU 时间线 / 性能排查:**先走项目 skill `.claude/skills/nsight-systems/SKILL.md`**(本机实战手册:实测采集配方、分析 SOP、kernel 名免 NVTX 归因法、避坑清单),不要重新调研。三条最致命的坑提前知道:中文 locale 下 report-fact/report-query 必挂(分析走 recipe + 报告副本放 C 盘);被测命令必须用 ASCII-only .bat 包装;nsys 注入会阉割子进程 stdout(本项目用 `SVF_PROBE_CACHE=1` 预生成元数据缓存绕过)。

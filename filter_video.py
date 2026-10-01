@@ -583,6 +583,8 @@ class VideoFilter:
                  dedup_sharp_side=256, dedup_backups=2, dedup_max_mem=48.0,
                  dedup_per_shot_max=None, dedup_per_shot_min=1,
                  dedup_max_gap_sec=1.0,
+                 dedup_of=False, dedup_of_dc=0.70, dedup_of_mr=0.50,
+                 dedup_of_mcv=0.70, dedup_of_run=3, dedup_of_interval=5,
                  hw_decode=True, decode_mode="auto",
                  pipeline=True, pipeline_depth=16, head_batch=True,
                  head_letterbox_workers=8, overlap="auto"):
@@ -686,6 +688,21 @@ class VideoFilter:
             print(f"[filter] WARNING: --dedup-per-shot-min({self.dedup_per_shot_min}) "
                   f"> --dedup-per-shot-max({self.dedup_per_shot_max}), "
                   f"配额镜头按 q=max(N,M)={self.dedup_per_shot_min} 帧送检")
+        # OFA(NVOF2)全局运动子区间间隔采样(opt-in, 默认全关=旧行为逐位不变):
+        # --dedup-of 开启后, GPU 臂(--decode pynvvc-gpu)逐帧算 OFA 光流信号,
+        # 三条件(dc/mr/mcv)判定帧级全局运动 → 连续>=dedup_of_run 帧的子区间内
+        # 段不再逐段送 rep, 改按 dedup_of_interval(10fps 基准帧数, 按 dec_fps
+        # 换算成恒定时间间隔, 与 --dedup-max-gap-sec 同款思路)取帧送检。
+        # 任一 OFA 环节失败 → WARNING 后禁用 OF 规则继续跑(纯 MAD 行为)。
+        self.dedup_of = bool(dedup_of)
+        self.dedup_of_dc = float(dedup_of_dc)
+        self.dedup_of_mr = float(dedup_of_mr)
+        self.dedup_of_mcv = float(dedup_of_mcv)
+        self.dedup_of_run = max(1, int(dedup_of_run))
+        self.dedup_of_interval = max(1, int(dedup_of_interval))
+        if self.dedup_of and not self.dedup:
+            print("[filter] WARNING: --dedup-of 未开 --dedup, OF 规则无生效对象"
+                  "(抽帧去重未启用), 本次运行忽略 --dedup-of")
         # NVDEC GPU 硬解（--hw-decode，默认开）：dec_cmd 在 -i 前插 -hwaccel cuda；
         # 硬解失败（ffmpeg 非 0 退出/异常）自动回退 CPU 软解重跑一次
         self.hw_decode = hw_decode
@@ -941,6 +958,14 @@ class VideoFilter:
         sf = dec_fps if (dec_fps and dec_fps > 0) else 10.0
         return max(self.dedup_min_seg, int(round(self.dedup_max_gap_sec * sf)))
 
+    def _dedup_of_interval_frames(self, dec_fps):
+        """OF 取帧间隔(帧)。--dedup-of-interval 给的是 10fps 基准帧数
+        (默认 5 = 0.5s@10fps), 按 dec_fps 比例换算成恒定时间间隔
+        (与 --dedup-max-gap-sec 的秒→帧换算同款思路): 20fps 下 0.5s → 10 帧。
+        dec_fps 探测失败按 10 兜底(换算恒等)。"""
+        sf = dec_fps if (dec_fps and dec_fps > 0) else 10.0
+        return max(1, int(round(self.dedup_of_interval * sf / 10.0)))
+
     def process(self, video_path, out_dir, yaw_lim, shared_csv=False):
         self.yaw_lim = yaw_lim
         w, h, fps, nframes = probe(video_path)
@@ -994,6 +1019,13 @@ class VideoFilter:
     def _run_pass(self, video_path, out_dir, yaw_lim, shared_csv,
                   w, h, size, fps, apply_fps, dec_fps, nframes, stem, use_pipe,
                   use_pynvvc=False):
+        # OFA 规则(--dedup-of)第一阶段仅 pynvvc-gpu 臂支持(逐帧信号走解码
+        # 池 RGB device 帧 → NVOF, 零拷贝); 宿主臂(含回退进入本臂的场景)
+        # 需要每帧额外 cvtColor+全帧 H2D(~4ms/帧)且多一层失败面, 回退臂
+        # 场景收益/成本不匹配 → 显式提示后不启用(纯 MAD 行为继续跑)。
+        if self.dedup_of:
+            print("  WARNING: --dedup-of 仅 --decode pynvvc-gpu 臂支持, "
+                  "本视频走宿主臂, OF 规则不启用(纯 MAD 抽帧行为)", flush=True)
         # 帧源: use_pynvvc=True → PyNvVideoCodec(NVDEC) 硬解帧源（自抽帧 + RGB→BGR）；
         #       use_pipe=True → 与落盘路径【同一条 ffmpeg 命令】(仅输出改 pipe:1)，
         #       NVDEC+GPU 转换直出 bgr24 到内存，不落 3GB raw（输出 bit-exact）；
@@ -2273,7 +2305,7 @@ class VideoFilter:
         import heapq
         import pycuda.driver as _drv
         from pycuda.gpuarray import GPUArray
-        from src.frame_dedup import SlotSegDeduper, ShotTracker
+        from src.frame_dedup import OfRunSampler, SlotSegDeduper, ShotTracker
         from src.gpu_decode import (AreaTables, DeviceFramePool, OVL_SETS,
                                     _OverlappedGpuSource, _PynvvcGpuSource,
                                     scrfd_block_detect)
@@ -2421,7 +2453,8 @@ class VideoFilter:
         seg_stats = {"segs": 0, "sent": 0, "reps": 0, "bk_judged": 0,
                      "sec_judged": 0, "sec_hits": 0,
                      "drop_seg": 0, "backup_hits": 0,
-                     "quota_shots": 0, "quota_sent": 0, "min_judged": 0}
+                     "quota_shots": 0, "quota_sent": 0, "min_judged": 0,
+                     "of_segs": 0, "of_pickups": 0, "of_sent": 0}
         dedup_dy_hits = 0
         try:
             dec_mode = "pynvvc-gpu"
@@ -2429,6 +2462,33 @@ class VideoFilter:
             sec_fps = dec_fps if (dec_fps and dec_fps > 0) else 10.0
             segs = []   # 已关闭待送检段: (rep_slot, rep_idx, backups, meta)
             _cur_judged = [None]   # 当前镜头工作项已判帧号集(top-up 去重用)
+
+            # ---- OFA 全局运动子区间间隔采样(opt-in --dedup-of) ----
+            # 初始化失败(任一 OFA 环节: dll/会话/kernel)→ WARNING 后本次
+            # 运行禁用 OF 规则继续跑(纯 MAD 行为), 不回退 Farneback 慢路径。
+            of_on = bool(self.dedup_of)
+            of_active = False     # 本视频是否实际算过 OF 信号(stdout 口径)
+            t_of = 0.0
+            of_eng = None
+            sampler = None
+            of_pend = []          # OF 取帧帧 [(idx, slot), ...] 待批量送检
+            if of_on:
+                try:
+                    from src.nvof import NvOFError, NvofEngine
+                    of_eng = g.get("nvof")
+                    if of_eng is None:
+                        of_eng = NvofEngine()
+                        g["nvof"] = of_eng
+                    of_eng.reset()   # 跨视频: 首帧重新当 prev(会话按 (w,h) 复用)
+                    sampler = OfRunSampler(
+                        min_run=self.dedup_of_run,
+                        interval=self._dedup_of_interval_frames(dec_fps))
+                except Exception as e:
+                    print(f"  WARNING: OFA(NVOF2) 初始化失败, 本次运行禁用 "
+                          f"OF 规则继续跑(纯 MAD 行为): {e!r}", flush=True)
+                    of_on = False
+                    of_eng = None
+                    sampler = None
 
             # ---- 驻留池槽分配器(最低自由槽优先, 确定性复用) ----
             free_slots = []
@@ -2725,6 +2785,28 @@ class VideoFilter:
                 finally:
                     _cur_judged[0] = None
 
+            def _process_of_batch(pairs):
+                """OF 取帧帧批量送检(--dedup-of 全局运动段): 逐帧过完整闸门链
+                (检测→pose68→keep→gaze/head), 无 sec/scan 补判 —— 全局运动
+                子区间内未取帧已判定可省, 不再回退补扫(试点口径)。送检完成
+                槽位归还驻留池。"""
+                slots = [sl for (_i, sl) in pairs]
+                dets, kpss = _detect_slots(slots)
+                items_f, fr_map = _face_land(slots, dets)
+                pose_map = _pose_batch(items_f)
+                for si, (idx, _sl) in enumerate(pairs):
+                    seg_stats["sent"] += 1
+                    seg_stats["of_sent"] += 1
+                    _judge_and_write(fr_map.get(si), idx, dets[si], kpss[si],
+                                     pose_map.get(si))
+                _stage_release(slots)
+
+            def _drain_of(force=False):
+                """OF 取帧帧排水: 攒小批送检(密度低, 8 帧或块尾/EOF 触发)。"""
+                if of_pend and (force or len(of_pend) >= 8):
+                    _process_of_batch(of_pend[:])
+                    of_pend.clear()
+
             def _pending_bytes():
                 # 挂起队列字节: shot_mode 用工作项自带字节, 原路径按段 meta
                 if shot_mode:
@@ -2782,11 +2864,49 @@ class VideoFilter:
                     tv = thumb_host[j * tb:(j + 1) * tb].reshape(tnh, tnw, 3)
                     sv = sharp_host[j * sb:(j + 1) * sb].reshape(snh, snw, 3)
                     decoded_frames += 1
+                    # OFA 逐帧信号(opt-in --dedup-of): 解码池 RGB device 帧
+                    # → NVOF(经 rgb2gray kernel 直写 GRAY8 输入 buffer, 零拷贝)
+                    # → GPU 归约 56B D2H → fm/mr/dc/mcv → 三条件帧级全局运动
+                    # 标志 → OfRunSampler 展宽。任一环节失败 → WARNING 一次后
+                    # 禁用 OF 规则(既成送检不撤, 后续帧纯 MAD 行为)。
+                    if of_on:
+                        t1o = time.time()
+                        try:
+                            fm, mr, dc, mcv = of_eng.compute_rgb(
+                                pool.slot(s0 + j), w, h)
+                        except Exception as e:
+                            print(f"  WARNING: OFA 执行失败, 本次运行禁用 "
+                                  f"OF 规则继续跑(纯 MAD 行为): {e!r}",
+                                  flush=True)
+                            of_on = False
+                            of_eng.reset()
+                        else:
+                            of_active = True
+                            t_of += time.time() - t1o
+                            sampler.push(decoded_frames,
+                                         (dc >= self.dedup_of_dc
+                                          and mr >= self.dedup_of_mr
+                                          and mcv <= self.dedup_of_mcv))
                     res = deduper.push_slot(tv, sv, fb, sl, decoded_frames)
                     if res is not None:
                         rep_sl, rep_idx, backups, meta = res
                         _seg = (rep_sl, rep_idx, backups, meta)
-                        if shot_mode:
+                        # 全局运动段(opt-in --dedup-of): 段内帧全在生效 run 内
+                        # → 不送 rep/补判, 仅按 (idx-run_start)%interval==0 取帧
+                        # 送检(取帧槽保留入 of_pend), 其余槽立即归还; 镜头表
+                        # 纯记录(镜头边界/账目不受影响), rows 照记 dedup_report。
+                        pk = sampler.seg_pickups(meta) if of_on else None
+                        if pk is not None:
+                            pkset = set(pk)
+                            tracker.add_segment(_seg)   # 纯记录(保镜头表)
+                            for (idx2, _sh, sl2) in meta["frames"]:
+                                if idx2 in pkset:
+                                    of_pend.append((idx2, sl2))
+                                else:
+                                    _stage_release([sl2])
+                            seg_stats["of_segs"] += 1
+                            seg_stats["of_pickups"] += len(pkset)
+                        elif shot_mode:
                             # 镜头工作项替代裸段入队(配额/保底 opt-in)
                             for it in tracker.add_segment(_seg, meta["frames"]):
                                 segs.append(it)
@@ -2798,6 +2918,8 @@ class VideoFilter:
                                 (fi, dif, meta["seg_id"],
                                  meta["seg_start"], meta["seg_end"],
                                  sh, isrep))
+                    if of_on:
+                        _drain_of()
                     if decoded_frames % self.detect_chunk == 0:
                         _drain_segs()
             # EOF: 宿主臂在最后一个不满 detect_chunk 的读块末尾也会排水一次
@@ -2808,7 +2930,18 @@ class VideoFilter:
             if res is not None:
                 rep_sl, rep_idx, backups, meta = res
                 _seg = (rep_sl, rep_idx, backups, meta)
-                if shot_mode:
+                pk = sampler.seg_pickups(meta) if of_on else None
+                if pk is not None:
+                    pkset = set(pk)
+                    tracker.add_segment(_seg)   # 纯记录(保镜头表)
+                    for (idx2, _sh, sl2) in meta["frames"]:
+                        if idx2 in pkset:
+                            of_pend.append((idx2, sl2))
+                        else:
+                            _stage_release([sl2])
+                    seg_stats["of_segs"] += 1
+                    seg_stats["of_pickups"] += len(pkset)
+                elif shot_mode:
                     for it in tracker.add_segment(_seg, meta["frames"]):
                         segs.append(it)
                 else:
@@ -2826,6 +2959,10 @@ class VideoFilter:
                 n = min(len(segs), self.detect_chunk)
                 _process_items(segs[:n])
                 del segs[:n]
+            # OF 收尾: 结算最后 run + 排空取帧帧(EOF 后 force)
+            if of_on:
+                _drain_of(force=True)
+                sampler.close()
 
             # NVDEC 拉帧+D2D 等待(read_block 内部累计)计入 decode 段
             t_dec += src.waited
@@ -2895,6 +3032,17 @@ class VideoFilter:
                                   f"{r['frame_start']},{r['frame_end']},"
                                   f"{r['frames']},{r['sent']},{r['quota']},"
                                   f"{r['close_reason']}\n")
+            if of_active and sampler is not None and sampler.runs:
+                # OF 全局运动子区间表(--dedup-of 产出): run 起止帧/长度/取帧数
+                # (批处理按 stem 命名防覆盖; 不参与批处理合并, 独立证据文件)
+                _oname = (f"{stem}_of_report.csv" if shared_csv
+                          else "of_report.csv")
+                with open(os.path.join(out_dir, _oname), "w",
+                          encoding="utf-8") as ofh:
+                    ofh.write("run_start,run_end,len,pickups\n")
+                    for r in sampler.runs:
+                        ofh.write(f"{r['run_start']},{r['run_end']},"
+                                  f"{r['len']},{r['pickups']}\n")
         finally:
             src.close()
             ex.shutdown(wait=True)
@@ -2912,7 +3060,8 @@ class VideoFilter:
               f"in {dt:.1f}s ({rate:.0f} fps)  -> {os.path.abspath(out_dir)}")
         print(f"    [breakdown] decode={t_dec:5.2f}s  read={t_read:5.2f}s  "
               f"detect={t_det:5.2f}s  judge={t_judge:5.2f}s  gaze={t_gaze:5.2f}s  "
-              f"head={t_head:5.2f}s  imwrite={t_write:5.2f}s ({kept} frames)")
+              f"head={t_head:5.2f}s  imwrite={t_write:5.2f}s ({kept} frames)"
+              + (f"  of={t_of:.2f}s" if of_active else ""))
         print(f"    [dedup] segments={seg_stats['segs']}  "
               f"reps={seg_stats['reps']}  "
               f"backup-judged={seg_stats['bk_judged']}  "
@@ -2925,7 +3074,11 @@ class VideoFilter:
               + (f"  quota-shots={seg_stats['quota_shots']}  "
                  f"quota-sent={seg_stats['quota_sent']}  "
                  f"min-judged={seg_stats['min_judged']}"
-                 if seg_stats["quota_shots"] or seg_stats["min_judged"] else ""))
+                 if seg_stats["quota_shots"] or seg_stats["min_judged"] else "")
+              + (f"  of-runs={len(sampler.runs)}  of-segs={seg_stats['of_segs']}  "
+                 f"of-pickups={seg_stats['of_pickups']}  "
+                 f"of-sent={seg_stats['of_sent']}"
+                 if of_active and sampler is not None else ""))
         out = {"frames": frame_no, "kept": kept, "no_face": drop_noface,
                "decode_mode": dec_mode,
                "pose": drop_pose, "down": drop_down, "multi": drop_multi,
@@ -3365,6 +3518,21 @@ def main():
     ap.add_argument("--dedup-max-mem", type=float, default=48.0,
                     help="dedup 段内全分辨率帧内存上限(MB, 高分辨率按帧大小自适应压段长; "
                          "1080p 默认 48 可容 ~8 帧, 4K 帧~24MB 只容 2 帧, 4K 想要真去重可调到 160)")
+    ap.add_argument("--dedup-of", action="store_true",
+                    help="OFA(NVOF2) 硬件光流全局运动子区间间隔采样"
+                         "(opt-in, 仅 --decode pynvvc-gpu 臂; 任一 OFA 环节"
+                         "失败自动禁用并提示)")
+    ap.add_argument("--dedup-of-dc", type=float, default=0.70,
+                    help="OF 全局运动三条件: 方向一致性下限(post8 标定 0.70)")
+    ap.add_argument("--dedup-of-mr", type=float, default=0.50,
+                    help="OF 全局运动三条件: 有效运动像素占比下限(0.50)")
+    ap.add_argument("--dedup-of-mcv", type=float, default=0.70,
+                    help="OF 全局运动三条件: 运动幅度变异系数上限(0.70)")
+    ap.add_argument("--dedup-of-run", type=int, default=3,
+                    help="OF 全局运动子区间最小连续帧数(run 展宽)")
+    ap.add_argument("--dedup-of-interval", type=int, default=5,
+                    help="OF 子区间取帧间隔, 10fps 基准帧数(5=0.5s@10fps;"
+                         "按 dec_fps 比例换算恒定时间间隔)")
     ap.add_argument("--quality", type=int, default=90, help="JPG quality")
     ap.add_argument("--no-score-name", action="store_true",
                     help="disable the TEMPORARY score/angle naming (just stem_index.jpg)")
@@ -3503,6 +3671,12 @@ def main():
                      dedup_sharp_side=args.dedup_sharp_side,
                      dedup_backups=args.dedup_backup,
                      dedup_max_mem=args.dedup_max_mem,
+                     dedup_of=args.dedup_of,
+                     dedup_of_dc=args.dedup_of_dc,
+                     dedup_of_mr=args.dedup_of_mr,
+                     dedup_of_mcv=args.dedup_of_mcv,
+                     dedup_of_run=args.dedup_of_run,
+                     dedup_of_interval=args.dedup_of_interval,
                      hw_decode=args.hw_decode,
                      decode_mode=args.decode,
                      pipeline=args.pipeline,
