@@ -191,11 +191,13 @@ compare100_*.csv)。
 python filter_video.py <video.mp4> --gaze-dy-dev 11
 ```
 
-目录批处理(两个位置参数:输入目录 + 统一输出目录)——输入目录下全部视频单层按名排序逐个处理,kept JPG 平铺进输出目录(带视频 stem 前缀),CSV 合并为输出目录的 `pose_report_all.csv`(首列 `video`):
+目录批处理(两个位置参数:输入目录 + 统一输出目录)——输入目录下全部视频单层按名排序逐个处理,kept JPG 平铺进输出目录(带视频 stem 前缀):
 
 ```bash
 python filter_video.py <视频目录> <输出目录>
 ```
+
+**抽帧去重默认已开**(2026-10 起):`--dedup`(MAD 分段去重 + 段内选最清晰帧 + 镜头配额 `--dedup-per-shot-max 4`)、`--dedup-of`(OFA/NVOF2 硬件光流"全局运动子区间间隔采样",仅 `--decode pynvvc-gpu` 臂生效,回退臂自动跳过)、`--no-csv`(不生成任何 CSV)。关闭分别用 `--no-dedup` / `--no-dedup-of` / `--csv`;`--csv` 时目录批处理合并生成 `pose_report_all.csv` / `dedup_report_all.csv` / `shot_table_all.csv`(首列 `video`)。
 
 常用参数(默认值均已在 `filter_video.py` argparse 中,上面表格为主):
 

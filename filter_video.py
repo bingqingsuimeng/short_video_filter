@@ -587,7 +587,8 @@ class VideoFilter:
                  dedup_of_mcv=0.70, dedup_of_run=3, dedup_of_interval=5,
                  hw_decode=True, decode_mode="auto",
                  pipeline=True, pipeline_depth=16, head_batch=True,
-                 head_letterbox_workers=8, overlap="auto"):
+                 head_letterbox_workers=8, overlap="auto",
+                 write_csv=True):
         # D 轮懒加载(§14): 宿主 SCRFD 实例不再在 __init__ 急建 —— pynvvc-gpu 臂
         # 下 _ensure_gpu_arm 会对同一引擎文件另建 device 实例, 宿主实例是纯死重
         # (§13.7-B: 日志两次 "engine loaded")。__init__ 只存配置, 首次访问时
@@ -656,7 +657,7 @@ class VideoFilter:
         self._head_model_path = head_model_path
         self._head_obj = None
         self._head_state = "pending"   # pending → ok / failed / off
-        # 抽帧去重 + 段内选最佳帧（--dedup 开启时生效，默认关，行为与旧版一致）
+        # 抽帧去重 + 段内选最佳帧（--dedup 默认开, --no-dedup 关闭=旧版行为）
         self.dedup = dedup
         self.dedup_cut_lo = dedup_cut_lo
         self.dedup_cut_hi = dedup_cut_hi
@@ -720,6 +721,9 @@ class VideoFilter:
         # auto=ThreadedDecoder 可用则开(初始化失败自动回退 A 轮串行臂),
         # off=保留 A 轮串行行为。详见 src/gpu_decode._OverlappedGpuSource。
         self.overlap = overlap
+        # --no-csv: 纯写文件门控(True=默认, 行为与旧版逐位一致; False=跳过全部
+        # 逐视频 CSV 与目录批处理合并 CSV, kept JPG 输出不受影响, 不碰判定/抽帧)
+        self.write_csv = bool(write_csv)
         # --decode pynvvc-gpu 显存直通臂：懒建设备侧资源（首次使用时创建,
         # 见 _ensure_gpu_arm）；其余帧源路径完全不触碰这些资源, 旧行为不变
         self.engine_path = engine                  # SCRFD 原引擎文件（device 臂同引擎另建实例）
@@ -1673,7 +1677,7 @@ class VideoFilter:
                             print(f"    #{no:05d} drop (gazedown dy={dy:.3f} "
                                   f"med={med:.3f})")
 
-            if report:
+            if self.write_csv and report:
                 csv_name = (f"pose_report_{stem}.csv" if shared_csv
                             else "pose_report.csv")
                 csv_path = os.path.join(out_dir, csv_name)
@@ -1686,7 +1690,7 @@ class VideoFilter:
                         gdt = f"{gd:.3f}" if gd is not None else ""
                         nht = f"{nh}" if nh is not None else ""
                         cf.write(f"{no},{vd},{sc:.3f},{y:.1f},{p:.1f},{r:.1f},{dtag},{nf},{etag},{gtag},{gdt},{nht}\n")
-            if dedup_rows:
+            if self.write_csv and dedup_rows:
                 # 仅 --dedup 时产出（与 pose_report.csv 并存，不动后者格式）：
                 # 逐解码帧的段切分/清晰度明细，供调 cut_lo/cut_hi。
                 # 共享 out_dir（目录批处理/显式 --out-dir）时按视频命名
@@ -1699,7 +1703,7 @@ class VideoFilter:
                     dfh.write("frame,diff,seg_id,seg_start,seg_end,sharp,is_rep\n")
                     for (fi, dif, sid, s0, s1, sh, isrep) in dedup_rows:
                         dfh.write(f"{fi},{dif:.3f},{sid},{s0},{s1},{sh:.1f},{isrep}\n")
-            if tracker is not None and tracker.table:
+            if self.write_csv and tracker is not None and tracker.table:
                 # 镜头表(镜头感知采样, --dedup 即产出): 镜头号/段数/起止帧/帧数/
                 # 送检帧数/是否配额镜头/关闭原因(cut=硬切, eof, memcap=护栏强关)。
                 # 命名规则与 dedup_report 相同: 批处理 <stem>_shot_table.csv,
@@ -2228,7 +2232,7 @@ class VideoFilter:
                             print(f"    #{no:05d} drop (gazedown dy={dy:.3f} "
                                   f"med={med:.3f})")
 
-            if report:
+            if self.write_csv and report:
                 csv_name = (f"pose_report_{stem}.csv" if shared_csv
                             else "pose_report.csv")
                 csv_path = os.path.join(out_dir, csv_name)
@@ -2241,7 +2245,7 @@ class VideoFilter:
                         gdt = f"{gd:.3f}" if gd is not None else ""
                         nht = f"{nh}" if nh is not None else ""
                         cf.write(f"{no},{vd},{sc:.3f},{y:.1f},{p:.1f},{r:.1f},{dtag},{nf},{etag},{gtag},{gdt},{nht}\n")
-            if dedup_rows:   # 本臂恒空, 保留同款守卫以防复用
+            if self.write_csv and dedup_rows:   # 本臂恒空, 保留同款守卫以防复用
                 with open(os.path.join(out_dir, "dedup_report.csv"), "w",
                           encoding="utf-8") as dfh:
                     dfh.write("frame,diff,seg_id,seg_start,seg_end,sharp,is_rep\n")
@@ -2995,7 +2999,7 @@ class VideoFilter:
                             print(f"    #{no:05d} drop (gazedown dy={dy:.3f} "
                                   f"med={med:.3f})")
 
-            if report:
+            if self.write_csv and report:
                 csv_name = (f"pose_report_{stem}.csv" if shared_csv
                             else "pose_report.csv")
                 csv_path = os.path.join(out_dir, csv_name)
@@ -3008,7 +3012,7 @@ class VideoFilter:
                         gdt = f"{gd:.3f}" if gd is not None else ""
                         nht = f"{nh}" if nh is not None else ""
                         cf.write(f"{no},{vd},{sc:.3f},{y:.1f},{p:.1f},{r:.1f},{dtag},{nf},{etag},{gtag},{gdt},{nht}\n")
-            if dedup_rows:
+            if self.write_csv and dedup_rows:
                 # 共享 out_dir(目录批处理/显式 --out-dir)按视频命名防互相覆盖;
                 # 单视频保持 dedup_report.csv(向后兼容)
                 _dname = (f"{stem}_dedup_report.csv" if shared_csv
@@ -3018,7 +3022,7 @@ class VideoFilter:
                     dfh.write("frame,diff,seg_id,seg_start,seg_end,sharp,is_rep\n")
                     for (fi, dif, sid, s0, s1, sh, isrep) in dedup_rows:
                         dfh.write(f"{fi},{dif:.3f},{sid},{s0},{s1},{sh:.1f},{isrep}\n")
-            if tracker is not None and tracker.table:
+            if self.write_csv and tracker is not None and tracker.table:
                 # 镜头表(--dedup 即产出; 与宿主臂同款): 批处理 <stem>_shot_table.csv,
                 # 单视频 shot_table.csv
                 _sname = (f"{stem}_shot_table.csv" if shared_csv
@@ -3032,7 +3036,7 @@ class VideoFilter:
                                   f"{r['frame_start']},{r['frame_end']},"
                                   f"{r['frames']},{r['sent']},{r['quota']},"
                                   f"{r['close_reason']}\n")
-            if of_active and sampler is not None and sampler.runs:
+            if self.write_csv and of_active and sampler is not None and sampler.runs:
                 # OF 全局运动子区间表(--dedup-of 产出): run 起止帧/长度/取帧数
                 # (批处理按 stem 命名防覆盖; 不参与批处理合并, 独立证据文件)
                 _oname = (f"{stem}_of_report.csv" if shared_csv
@@ -3351,11 +3355,12 @@ def main():
   python filter_video.py video.mp4                    单视频 -> <视频所在目录>/<stem>_kept + pose_report.csv
   python filter_video.py video_dir                     视频目录 -> <video_dir>/kept_frames/<stem>_kept 每视频一目录(旧行为)
   python filter_video.py video_dir out_dir             目录批处理: 目录下全部视频(.mp4/.mkv/.mov/.avi,单层,按名排序),
-                                                       kept JPG 平铺进 out_dir(带视频 stem 前缀),
-                                                       CSV 合并为 out_dir/pose_report_all.csv(首列 video)
+                                                       kept JPG 平铺进 out_dir(带视频 stem 前缀)
   python filter_video.py video_dir out_dir --gaze-dy-dev 11
                                                        所有 flag 与单视频模式完全相同(默认 --decode auto;
-                                                       显存直通臂显式加 --decode pynvvc-gpu, overlap 默认 auto)""")
+                                                       显存直通臂显式加 --decode pynvvc-gpu, overlap 默认 auto)
+  默认已开: --dedup(MAD 分段去重+镜头配额4) --dedup-of(OFA 光流, 仅 GPU 臂)
+           --no-csv(不生成 CSV); 关闭用 --no-dedup / --no-dedup-of / --csv""")
     ap.add_argument("input", nargs="?", default=None,
                     help="mp4 file or a directory of videos "
                          "(可省略, 若用 --image-dir 跑纯图片文件夹模式)")
@@ -3479,10 +3484,12 @@ def main():
                          "拉帧+D2D, 主线程满速推理（初始化失败自动 WARNING 回退 A 轮"
                          "串行臂）; off=A 轮串行行为（A/B 用）; on=强制开（失败同样"
                          "回退串行）。判定逐位不变（同一共享流保序, 帧即拉即拷）")
-    ap.add_argument("--dedup", action="store_true",
-                    help="抽帧去重+段内选最佳帧(默认关): 连续相似帧分段, 段内选最清晰一张"
-                         "(避运动模糊)送检; 快速动作/scene cut 逐帧独立成段→不漏帧; "
-                         "rep 被闸门 drop 时按清晰度次序对 backup 帧补跑闸门取第一个 keep")
+    ap.add_argument("--dedup", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="抽帧去重+段内选最佳帧(默认开, --no-dedup 关): 连续相似帧分段, "
+                         "段内选最清晰一张(避运动模糊)送检; 快速动作/scene cut 逐帧独立成段"
+                         "→不漏帧; rep 被闸门 drop 时按清晰度次序对 backup 帧补跑闸门取第一个 "
+                         "keep")
     ap.add_argument("--dedup-cut-lo", type=float, default=2.0,
                     help="dedup 低阈值(128px 灰度缩略图相邻帧平均绝对差): diff>=cut_lo 且"
                          "段长>=min_seg 关段(滞回防闪烁)")
@@ -3518,9 +3525,11 @@ def main():
     ap.add_argument("--dedup-max-mem", type=float, default=48.0,
                     help="dedup 段内全分辨率帧内存上限(MB, 高分辨率按帧大小自适应压段长; "
                          "1080p 默认 48 可容 ~8 帧, 4K 帧~24MB 只容 2 帧, 4K 想要真去重可调到 160)")
-    ap.add_argument("--dedup-of", action="store_true",
+    ap.add_argument("--dedup-of", action=argparse.BooleanOptionalAction,
+                    default=True,
                     help="OFA(NVOF2) 硬件光流全局运动子区间间隔采样"
-                         "(opt-in, 仅 --decode pynvvc-gpu 臂; 任一 OFA 环节"
+                         "(默认开, 需 --dedup; --no-dedup-of 关; 仅 --decode "
+                         "pynvvc-gpu 臂生效, 回退臂自动跳过; 任一 OFA 环节"
                          "失败自动禁用并提示)")
     ap.add_argument("--dedup-of-dc", type=float, default=0.70,
                     help="OF 全局运动三条件: 方向一致性下限(post8 标定 0.70)")
@@ -3536,6 +3545,12 @@ def main():
     ap.add_argument("--quality", type=int, default=90, help="JPG quality")
     ap.add_argument("--no-score-name", action="store_true",
                     help="disable the TEMPORARY score/angle naming (just stem_index.jpg)")
+    ap.add_argument("--csv", action=argparse.BooleanOptionalAction, default=False,
+                    help="生成 CSV(默认不生成, --no-csv 同效): 目录批处理=写 "
+                         "pose_report_<stem>/<stem>_dedup_report/<stem>_shot_table 及合并的 "
+                         "pose_report_all/dedup_report_all/shot_table_all; 单视频=写 "
+                         "pose_report/dedup_report/shot_table 等逐视频 CSV。"
+                         "kept JPG 与判定/抽帧逻辑不受影响")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     if (args.dedup and args.dedup_max_seg is None
@@ -3682,7 +3697,8 @@ def main():
                      pipeline=args.pipeline,
                      pipeline_depth=args.pipeline_depth,
                      head_batch=args.head_batch,
-                     overlap=args.overlap)
+                     overlap=args.overlap,
+                     write_csv=args.csv)
     if dir_batch:
         # 目录批处理模式: 逐视频进度行 + 重名防护 + 收尾合并 CSV + 汇总
         stems_done = []   # [(视频文件名, stem)] 已处理
@@ -3717,12 +3733,17 @@ def main():
 
         results, failed, dt = vf.run(targets, args.yaw, shared_csv=True,
                                      on_video=_on_video)
-        merge_pose_reports(batch_out, [os.path.basename(p) for p, _ in targets])
-        if args.dedup:
-            merge_dedup_reports(batch_out,
-                                [os.path.basename(p) for p, _ in targets])
-            merge_shot_tables(batch_out,
-                              [os.path.basename(p) for p, _ in targets])
+        if not args.csv:
+            print("  [no-csv] 跳过 CSV 合并(未生成逐视频 CSV)")
+        else:
+            merge_pose_reports(batch_out,
+                               [os.path.basename(p) for p, _ in targets])
+            if args.dedup:
+                merge_dedup_reports(batch_out,
+                                    [os.path.basename(p)
+                                     for p, _ in targets])
+                merge_shot_tables(batch_out,
+                                  [os.path.basename(p) for p, _ in targets])
         total_kept = sum(o["kept"] for _, o in results)
         print(f"\n[目录批处理] done={len(results)} failed={len(failed)} "
               f"kept 合计={total_kept}  总墙钟 {dt:.1f}s  -> "
